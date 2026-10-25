@@ -38,8 +38,8 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/<你的用户名>/<仓库名>.git
-cd <仓库名>
+git clone https://github.com/sunyu616/vasptool.git
+cd vasptool
 
 # 方式一：安装到 PATH（推荐）
 mkdir -p ~/Script && find . -maxdepth 3 -type f \( -name "*.py" -o ! -name "*.*" \) -exec cp {} ~/Script/ \;
