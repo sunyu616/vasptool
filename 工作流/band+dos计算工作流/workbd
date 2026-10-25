@@ -1,0 +1,872 @@
+#!/bin/bash
+
+echo "======================================================"
+echo "  Initializing VASP Automation Workflow..."
+echo "  Generating Python core: vasp_workflow.py"
+echo "======================================================"
+
+# 使用单引号包裹 EOF，防止 Bash 提前解析内部特殊字符
+cat << 'EOF_PYTHON' > vasp_workflow.py
+import os
+import shutil
+import subprocess
+import re
+import stat
+import time
+import glob
+import numpy as np
+
+# ==============================================================================
+# 0. 主工作流日志引擎 (极简清爽版)
+# ==============================================================================
+class LogColors:
+    RESET = "\033[0m"
+    SUCCESS = "\033[92m"   # 绿色
+    ERROR = "\033[91m"     # 红色
+    ITER = "\033[1;35m"    # 紫色
+    DATA = "\033[94m"      # 蓝色
+    WARN = "\033[93m"      # 黄色
+
+def c_log(msg, level="INFO"):
+    """单通道彩色输出，彻底解决 nohup 日志交错覆盖的问题"""
+    if not msg:
+        print("", flush=True)
+        return
+
+    # 精简时间格式，去掉日期只保留时分秒
+    t_str = time.strftime('%H:%M:%S')
+    color = ""
+    if level == "ERROR": color = LogColors.ERROR
+    elif level == "SUCCESS": color = LogColors.SUCCESS
+    elif level == "ITER": color = LogColors.ITER
+    elif level == "DATA": color = LogColors.DATA
+    elif level == "WARN": color = LogColors.WARN
+
+    color_suffix = LogColors.RESET if color else ""
+    # 直接使用 print，由外层的 nohup 负责重定向到文件
+    print(f"{color}{t_str} | [{level:^7}] {msg}{color_suffix}", flush=True)
+
+# ==============================================================================
+# 1. 内置脚本代码区 (保留原有物理与监控逻辑)
+# ==============================================================================
+
+VASP_INFINITE_WAIT_SCRIPT = r'''import os
+import time
+import subprocess
+import shutil
+import numpy as np
+import sys
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+from email.header import Header
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_PLOT = True
+except ImportError:
+    HAS_PLOT = False
+
+HAS_SYMMETRY_LIB = False
+try:
+    import ase
+    from ase.io import read, write
+    import spglib
+    from ase import Atoms
+    from ase.build import make_supercell
+    HAS_SYMMETRY_LIB = True
+except ImportError:
+    HAS_SYMMETRY_LIB = False
+
+# ================== 1. USER CONFIGURATION ==================
+SCRIPT_MODE = 'MONITOR'  
+ENABLE_SYMMETRY = True         
+TOLERANCE_SWEEP = [0.001, 0.01, 0.1, 0.2, 0.5] 
+SYNC_MODE = 'None'   
+OPT_A = True  
+OPT_B = True  
+OPT_C = False 
+
+ENABLE_EMAIL = True                  
+SMTP_SERVER = "smtp.qq.com"          
+SMTP_PORT = 465                      
+SENDER_EMAIL = "your_qq_number@qq.com"    
+SENDER_PASSWORD = "在此填入QQ邮箱授权码" 
+RECEIVER_EMAIL = "your_qq_number@qq.com"  
+
+SUBMIT_CMD = "qsub wk.pbs"      
+CHECK_CMD = "qstat"             
+JOB_ID_REGEX = r"(\d+)\.master" 
+MAX_RETRIES = 3                 
+
+MIN_CHECK_INTERVAL = 5     
+MAX_CHECK_INTERVAL = 60    
+
+TARGET_TOLERANCE = 1.0      
+MAX_ITER = 20               
+MAX_STRAIN_PER_STEP = 0.04  
+
+INITIAL_ALPHA = 0.0005 
+MIN_ALPHA = 0.0001     
+MAX_ALPHA = 0.0050     
+
+# ================== 2. LOGGING ENGINE (Optimized) ==================
+class LogColors:
+    RESET = "\033[0m"
+    SUCCESS = "\033[92m"   
+    ERROR = "\033[91m"     
+    ITER = "\033[1;35m"    
+    DATA = "\033[94m"      
+
+def c_log(msg, level="INFO"):
+    if not msg:
+        try:
+            with open("auto_opt.log", "a", encoding="utf-8") as f: f.write("\n")
+        except: pass
+        return
+    t_str = time.strftime('%H:%M:%S')
+    color = ""
+    if level == "ERROR": color = LogColors.ERROR
+    elif level == "SUCCESS": color = LogColors.SUCCESS
+    elif level == "ITER": color = LogColors.ITER
+    elif level == "DATA": color = LogColors.DATA
+
+    color_suffix = LogColors.RESET if color else ""
+    clean_line = f"{t_str} | [{level:^7}] {msg}"
+    colored_line = f"{color}{clean_line}{color_suffix}"
+    
+    print(colored_line, flush=True) 
+    try:
+        with open("auto_opt.log", "a", encoding="utf-8") as f: f.write(clean_line + "\n")
+    except: pass
+
+history_db = []
+current_alphas = np.array([INITIAL_ALPHA, INITIAL_ALPHA, INITIAL_ALPHA])
+
+# ================== 3. CORE SYMMETRY LOGIC ==================
+def enforce_symmetry(file_path="POSCAR", is_final=False):
+    if not ENABLE_SYMMETRY: return False
+    if not HAS_SYMMETRY_LIB: return False
+    try:
+        if not os.path.exists(file_path): return False
+        atoms = read(file_path)
+        orig_symbols = atoms.get_chemical_symbols()
+        orig_order = []
+        for sym in orig_symbols:
+            if sym not in orig_order: orig_order.append(sym)
+                
+        cell_tuple = (atoms.get_cell(), atoms.get_scaled_positions(), atoms.get_atomic_numbers())
+        
+        best_dataset = None
+        best_symprec = None
+        max_sg_num = -1
+        
+        for tol in TOLERANCE_SWEEP:
+            ang_tol = -1.0 if tol < 0.1 else 5.0 
+            dataset = spglib.get_symmetry_dataset(cell_tuple, symprec=tol, angle_tolerance=ang_tol)
+            if dataset is not None:
+                sg_num = dataset['number']
+                if sg_num > max_sg_num:
+                    max_sg_num = sg_num
+                    best_dataset = dataset
+                    best_symprec = tol
+                    
+        if best_dataset is None: return False
+        std_cell = spglib.standardize_cell(cell_tuple, to_primitive=False, no_idealize=False, symprec=best_symprec)
+        
+        if std_cell is not None:
+            new_lattice, new_positions, new_numbers = std_cell
+            if len(new_numbers) < len(atoms):
+                C_orig = atoms.get_cell(); C_std = new_lattice
+                P = np.dot(C_orig, np.linalg.inv(C_std)); P_int = np.round(P).astype(int)
+                if np.max(np.abs(P - P_int)) > 0.05: return False
+                std_atoms = Atoms(numbers=new_numbers, cell=new_lattice, scaled_positions=new_positions, pbc=True)
+                final_atoms = make_supercell(std_atoms, P_int)
+                if len(final_atoms) != len(atoms): return False
+            else:
+                final_atoms = Atoms(numbers=new_numbers, cell=new_lattice, scaled_positions=new_positions, pbc=True)
+            
+            sorted_indices = []
+            for sym in orig_order:
+                for i, atom in enumerate(final_atoms):
+                    if atom.symbol == sym: sorted_indices.append(i)
+            final_atoms = final_atoms[sorted_indices]
+            write(file_path, final_atoms, format='vasp', vasp5=True)
+            return True
+        else: return False
+    except: return False
+
+# ================== 4. COMMAND & MONITORING ==================
+def run_cmd(cmd):
+    try: return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8', errors='ignore').strip()
+    except: return ""
+
+def get_nelm_from_incar():
+    nelm = 60
+    if os.path.exists("INCAR"):
+        try:
+            with open("INCAR", 'r') as f:
+                for line in f:
+                    if "NELM" in line and "=" in line:
+                        val = re.search(r"NELM\s*=\s*(\d+)", line)
+                        if val: nelm = int(val.group(1))
+        except: pass
+    return nelm
+
+def check_electronic_convergence():
+    if not os.path.exists("OSZICAR"): return True 
+    nelm = get_nelm_from_incar()
+    last_steps = 0
+    try:
+        with open("OSZICAR", 'r') as f:
+            lines = f.readlines()
+            for line in reversed(lines):
+                if "DAV:" in line or "RMM:" in line:
+                    parts = line.split()
+                    if len(parts) > 1: last_steps = int(parts[1])
+                    break
+    except: pass
+    if last_steps >= nelm: return False
+    return True
+
+def check_job_success():
+    if not os.path.exists("OUTCAR"): return False
+    try:
+        fsize = os.path.getsize("OUTCAR")
+        if fsize == 0: return False
+        with open("OUTCAR", 'rb') as f:
+            f.seek(max(0, fsize - 51200))
+            if "General timing" in f.read().decode('utf-8', errors='ignore'): return True
+    except: pass
+    return False
+
+def submit_job():
+    out = run_cmd(SUBMIT_CMD)
+    match = re.search(JOB_ID_REGEX, out)
+    if match: return match.group(1)
+    alt = re.search(r"(\d+)", out)
+    return alt.group(1) if alt else None
+
+def is_job_running(job_id):
+    out = run_cmd(CHECK_CMD)
+    if job_id not in out: return False
+    for line in out.splitlines():
+        if job_id in line and re.search(r"\s[CE]\s|\s[CE]$", line): return False
+    return True
+
+def wait_job(job_id):
+    time.sleep(MIN_CHECK_INTERVAL)
+    curr = MIN_CHECK_INTERVAL
+    while is_job_running(job_id):
+        time.sleep(curr)
+        curr = min(curr * 1.2, MAX_CHECK_INTERVAL)
+    time.sleep(5)
+
+# ================== 5. VISUALIZATION & NOTIFICATION ==================
+def generate_optimization_plot():
+    if not HAS_PLOT or not history_db: return None
+    try:
+        iters = [d['iter'] for d in history_db]
+        s_xx = [d['stress'][0] for d in history_db]
+        s_yy = [d['stress'][1] for d in history_db]
+        s_zz = [d['stress'][2] for d in history_db]
+        
+        plt.figure(figsize=(8, 5))
+        plt.plot(iters, s_xx, 'r-o', label='Stress XX')
+        plt.plot(iters, s_yy, 'g-s', label='Stress YY')
+        plt.plot(iters, s_zz, 'b-^', label='Stress ZZ')
+        
+        plt.axhline(y=TARGET_TOLERANCE, color='k', linestyle='--', alpha=0.3)
+        plt.axhline(y=-TARGET_TOLERANCE, color='k', linestyle='--', alpha=0.3)
+        plt.axhline(y=0, color='k', linestyle='-', alpha=0.5)
+        
+        plt.title('VASP Optimization History')
+        plt.xlabel('Iteration')
+        plt.ylabel('Stress (kB)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        img_name = "opt_progress.png"
+        plt.savefig(img_name)
+        plt.close()
+        return img_name
+    except: return None
+
+def send_email(status, start_time, iter_count=0, stress=None):
+    if not ENABLE_EMAIL: return
+    duration = time.time() - start_time
+    m, s = divmod(duration, 60)
+    h, m = divmod(m, 60)
+    
+    msg = MIMEMultipart()
+    short_dir = os.path.basename(os.getcwd())
+    
+    if SCRIPT_MODE == 'OPT':
+        subject = f"[VASP OPT] {status} (Iter {iter_count})"
+        s_str = f"XX={stress[0]:.2f}, YY={stress[1]:.2f}, ZZ={stress[2]:.2f}" if stress is not None else "N/A"
+        body = f"Status: {status}\nWorkDir: {short_dir}\nDuration: {int(h)}h {int(m)}m {int(s)}s\nIterations: {iter_count}\nStress (kB): {s_str}\n"
+        img_path = generate_optimization_plot()
+        if img_path and os.path.exists(img_path):
+            try:
+                with open(img_path, 'rb') as f: img_data = f.read()
+                msg.attach(MIMEImage(img_data, name=os.path.basename(img_path)))
+            except: pass
+    else:
+        subject = f"[VASP Monitor] {status}"
+        body = f"Status: {status}\nWorkDir: {short_dir}\nDuration: {int(h)}h {int(m)}m {int(s)}s\n"
+
+    msg['Subject'] = Header(subject, 'utf-8')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECEIVER_EMAIL
+    msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+    try:
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], msg.as_string())
+        server.quit()
+    except: pass
+
+# ================== 6. OPTIMIZATION LOGIC ==================
+def read_stress_kb():
+    if not os.path.exists("OUTCAR"): return None
+    try:
+        with open("OUTCAR", 'r') as f:
+            for line in reversed(f.readlines()):
+                if "in kB" in line:
+                    parts = line.split()
+                    try: return np.array([float(parts[2]), float(parts[3]), float(parts[4])])
+                    except: continue
+    except: pass
+    return None
+
+def calculate_next_strain(current_stress):
+    global current_alphas, history_db
+    strains = np.zeros(3)
+    for i in range(3):
+        if len(history_db) >= 1:
+            prev = history_db[-1]
+            d_stress = current_stress[i] - prev['stress'][i]
+            d_strain = prev['strain'][i]
+            if current_stress[i] * prev['stress'][i] < 0: current_alphas[i] *= 0.5 
+            elif abs(d_stress) > 1.0 and abs(d_strain) > 1e-5:
+                local_alpha = abs(d_strain / d_stress)
+                local_alpha = max(MIN_ALPHA, min(local_alpha, MAX_ALPHA))
+                current_alphas[i] = 0.6 * current_alphas[i] + 0.4 * local_alpha
+        mag = abs(current_stress[i]) * current_alphas[i]
+        val = mag if current_stress[i] > 0 else -mag
+
+        current_max = MAX_STRAIN_PER_STEP
+        if abs(current_stress[i]) < 15.0:
+            dynamic_limit = max(0.005, abs(current_stress[i]) * MAX_ALPHA)
+            current_max = min(MAX_STRAIN_PER_STEP, dynamic_limit)
+
+        if abs(val) > current_max: val = np.sign(val) * current_max
+        if abs(val) < 1e-4: val = 0.0
+        strains[i] = val
+    return strains
+
+def update_poscar(current_stress):
+    if not os.path.exists("CONTCAR") or os.path.getsize("CONTCAR") < 10: return False
+    shutil.copy2("CONTCAR", "POSCAR")
+    try:
+        with open("POSCAR", 'r') as f: lines = f.readlines()
+        vecs = [np.array([float(x) for x in lines[i].split()]) for i in range(2, 5)]
+    except: return False
+
+    eff_stress = np.copy(current_stress)
+    if SYNC_MODE == 'AB':
+        mean_v = np.mean(eff_stress[:2]); eff_stress[0] = eff_stress[1] = mean_v
+    elif SYNC_MODE == 'ABC':
+        mean_v = np.mean(eff_stress); eff_stress[:] = mean_v
+
+    strains = calculate_next_strain(eff_stress)
+    if SYNC_MODE == 'AB': strains[0] = strains[1] = np.mean(strains[:2])
+    elif SYNC_MODE == 'ABC': strains[:] = np.mean(strains)
+
+    history_db.append({'iter': len(history_db)+1, 'stress': np.copy(eff_stress), 'strain': np.copy(strains)})
+    for i in range(3):
+        if [OPT_A, OPT_B, OPT_C][i]: vecs[i] = vecs[i] * (1.0 + strains[i])
+        lines[2+i] = f" {vecs[i][0]:22.16f} {vecs[i][1]:22.16f} {vecs[i][2]:22.16f}\n"
+
+    with open("POSCAR", 'w') as f: f.writelines(lines)
+    return True
+
+# ================== 7. MAIN EXECUTION ==================
+def main():
+    start_t = time.time()
+    open("auto_opt.log", "w").close() 
+    
+    if SCRIPT_MODE == 'OPT':
+        f_status = "Failed"; stress = None
+        for i in range(1, MAX_ITER + 1):
+            success = False
+            for retry in range(MAX_RETRIES + 1):
+                enforce_symmetry("POSCAR") 
+                job_id = submit_job()
+                if not job_id: time.sleep(30); continue
+                wait_job(job_id)
+                if not check_job_success():
+                    if retry < MAX_RETRIES and os.path.exists("CONTCAR"):
+                        shutil.copy2("CONTCAR", "POSCAR"); continue
+                    else: break
+                if not check_electronic_convergence(): break 
+                success = True; break
+            
+            if not success: f_status = "Aborted"; break
+            stress = read_stress_kb()
+            if stress is None: break
+            
+            converged = True
+            if OPT_A and abs(stress[0]) > TARGET_TOLERANCE: converged = False
+            if OPT_B and abs(stress[1]) > TARGET_TOLERANCE: converged = False
+            if OPT_C and abs(stress[2]) > TARGET_TOLERANCE: converged = False
+            
+            if converged:
+                f_status = "Converged"; break
+            if not update_poscar(stress): break
+        
+        if os.path.exists("CONTCAR"):
+            shutil.copy2("CONTCAR", "POSCAR")
+            enforce_symmetry("POSCAR", is_final=True)
+            shutil.copy2("POSCAR", "CONTCAR")
+        send_email(f_status, start_t, i, stress)
+    else:
+        jid = submit_job()
+        if jid: 
+            wait_job(jid)
+            if check_job_success(): m_status = "Success"
+            else: m_status = "Failed/Incomplete"
+            send_email(m_status, start_t)
+
+if __name__ == "__main__":
+    main()
+'''
+
+DOSCAL_SCRIPT = r'''#!/bin/bash
+set -e
+
+MODE="UNKNOWN"
+FILE_NM="PDOS_ELEMENTS.dat"
+FILE_UP="PDOS_ELEMENTS_UP.dat"
+FILE_DW="PDOS_ELEMENTS_DW.dat"
+DATA_LINES=0
+
+if [[ -f "$FILE_UP" && -f "$FILE_DW" ]]; then
+    MODE="FM"
+    DATA_LINES=$(grep -v "#" "$FILE_UP" | grep -v "^$" | wc -l)
+elif [[ -f "$FILE_NM" ]]; then
+    MODE="NM"
+    DATA_LINES=$(grep -v "#" "$FILE_NM" | grep -v "^$" | wc -l)
+else
+    exit 1
+fi
+
+PYTHON_SCRIPT="plot_pdos_v4.py"
+OUTPUT_IMG="PDOS_final_v4.png"
+
+cat << EOF > "$PYTHON_SCRIPT"
+import matplotlib.pyplot as plt
+import numpy as np
+import sys
+from scipy.interpolate import make_interp_spline
+
+colors = ['#E64B35', '#4DBBD5', '#00A087', '#3C5488', 
+          '#F39B7F', '#8491B4', '#91D1C2', '#DC0000']
+
+plt.rcParams['text.usetex'] = False
+plt.rcParams['mathtext.fontset'] = 'cm'
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
+plt.rcParams['font.size'] = 14
+plt.rcParams['axes.linewidth'] = 1.5
+
+mode = "$MODE"
+xlim_val = 3.0
+
+def smooth_data(x, y, mult=10):
+    if len(x) < 4: return x, y
+    try:
+        x_new = np.linspace(x.min(), x.max(), len(x) * mult)
+        spl = make_interp_spline(x, y, k=3)
+        y_new = spl(x_new)
+        y_new = np.maximum(y_new, 0)
+        return x_new, y_new
+    except: return x, y
+
+def read_pdos(filename):
+    try:
+        with open(filename, 'r') as f:
+            header = f.readline().strip()
+        cols = header.replace('#', '').split()
+        labels = cols[1:]
+        data = np.loadtxt(filename)
+        return data[:, 0], data[:, 1:], labels
+    except Exception as e:
+        sys.exit(f"Error reading {filename}: {e}")
+
+dos_dict = {}
+elements = []
+
+if mode == "NM":
+    eng, data, lbls = read_pdos("$FILE_NM")
+    elements = lbls
+    for i, elem in enumerate(elements):
+        x_sm, y_sm = smooth_data(eng, data[:, i])
+        dos_dict[elem] = {'x': x_sm, 'y': y_sm}
+
+elif mode == "FM":
+    eng_u, data_u, lbls_u = read_pdos("$FILE_UP")
+    eng_d, data_d, lbls_d = read_pdos("$FILE_DW")
+    
+    min_len = min(len(eng_u), len(eng_d))
+    eng_u = eng_u[:min_len]; data_u = data_u[:min_len]
+    eng_d = eng_d[:min_len]; data_d = data_d[:min_len]
+
+    elements = lbls_u
+    for i, elem in enumerate(elements):
+        xu_sm, yu_sm = smooth_data(eng_u, data_u[:, i])
+        raw_dw_abs = np.abs(data_d[:, i])
+        xd_sm, yd_sm_abs = smooth_data(eng_d, raw_dw_abs)
+        yd_sm = -1.0 * yd_sm_abs
+        dos_dict[elem] = {'x_up': xu_sm, 'y_up': yu_sm, 'x_dw': xd_sm, 'y_dw': yd_sm}
+
+max_val = 0.0
+for elem in elements:
+    if mode == "NM":
+        d = dos_dict[elem]
+        mask = (d['x'] >= -xlim_val) & (d['x'] <= xlim_val)
+        if np.any(mask): max_val = max(max_val, np.max(d['y'][mask]))
+    elif mode == "FM":
+        d = dos_dict[elem]
+        mask_u = (d['x_up'] >= -xlim_val) & (d['x_up'] <= xlim_val)
+        mask_d = (d['x_dw'] >= -xlim_val) & (d['x_dw'] <= xlim_val)
+        if np.any(mask_u): max_val = max(max_val, np.max(d['y_up'][mask_u]))
+        if np.any(mask_d): max_val = max(max_val, np.max(np.abs(d['y_dw'][mask_d])))
+
+if max_val < 0.1: max_val = 1.0
+limit = max_val * 1.1
+
+ymin, ymax = (0, limit) if mode == "NM" else (-limit, limit)
+fig, ax = plt.subplots(figsize=(10, 5))
+
+ax.axvline(x=0, color='gray', linestyle='--', linewidth=1.0, alpha=0.8)
+ax.axhline(y=0, color='black', linewidth=0.8, alpha=0.5)
+
+for i, elem in enumerate(elements):
+    col = colors[i % len(colors)]
+    if mode == "NM":
+        d = dos_dict[elem]
+        ax.plot(d['x'], d['y'], color=col, linewidth=1.5, label=elem)
+        ax.fill_between(d['x'], 0, d['y'], color=col, alpha=0.2)
+    elif mode == "FM":
+        d = dos_dict[elem]
+        ax.plot(d['x_up'], d['y_up'], color=col, linewidth=1.5, label=elem)
+        ax.fill_between(d['x_up'], 0, d['y_up'], color=col, alpha=0.2)
+        ax.plot(d['x_dw'], d['y_dw'], color=col, linewidth=1.5)
+        ax.fill_between(d['x_dw'], 0, d['y_dw'], color=col, alpha=0.2)
+
+ax.set_xlim(-xlim_val, xlim_val)
+ax.set_ylim(ymin, ymax)
+ax.set_xlabel('Energy (eV)', fontsize=16)
+ax.set_ylabel('PDOS', fontsize=16)
+ax.legend(frameon=False, fontsize=12, loc='best')
+
+plt.tight_layout()
+plt.savefig("$OUTPUT_IMG", dpi=300, bbox_inches='tight')
+EOF
+
+python3 "$PYTHON_SCRIPT"
+rm "$PYTHON_SCRIPT"
+'''
+
+BANDCAL_SCRIPT = r'''#!/bin/bash
+set -e
+
+if [ ! -f BAND.dat ] || [ ! -f KLABELS ]; then
+    exit 1
+fi
+
+IS_FM="false"
+if [ -f OUTCAR ]; then
+    ispin=$(grep "ISPIN" OUTCAR | tail -1 | awk -F'=' '{print $2}' | awk '{print $1}')
+    if [ "$ispin" == "2" ]; then IS_FM="true"; fi
+fi
+
+PYTHON_SCRIPT="plot_band_custom.py"
+OUTPUT_IMG="band_structure.png"
+
+cat << EOF > "$PYTHON_SCRIPT"
+import matplotlib.pyplot as plt
+import numpy as np
+import sys
+
+plt.rcParams['text.usetex'] = False
+plt.rcParams['mathtext.fontset'] = 'cm'
+plt.rcParams['font.family'] = 'STIXGeneral'
+plt.rcParams['font.size'] = 14
+plt.rcParams['axes.linewidth'] = 1.2
+
+band_file = "BAND.dat"
+klabels_file = "KLABELS"
+is_fm = "$IS_FM" == "true"
+output_file = "$OUTPUT_IMG"
+
+ymin, ymax, ystep = -10, 10, 10
+
+try:
+    data = np.loadtxt(band_file)
+    k_path = data[:, 0]
+    energies = data[:, 1:]
+except Exception as e:
+    sys.exit(1)
+
+ticks, labels = [], []
+try:
+    with open(klabels_file, 'r') as f:
+        for line in f:
+            if line.strip().startswith('#') or not line.strip(): continue
+            parts = line.strip().split()
+            if len(parts) < 2: continue
+            try:
+                coord = float(parts[0])
+                label_raw = parts[1]
+            except ValueError:
+                try:
+                    coord = float(parts[1])
+                    label_raw = parts[0]
+                except ValueError: continue
+
+            if label_raw.upper() in ['G', 'GAMMA']: label = r'$\Gamma$'
+            else: label = label_raw.replace("'", "").replace('"', "")
+
+            ticks.append(coord)
+            labels.append(label)
+
+    seen = set()
+    ticks_unique, labels_unique = [], []
+    for t, l in zip(ticks, labels):
+        if t not in seen:
+            ticks_unique.append(t); labels_unique.append(l); seen.add(t)
+    ticks, labels = ticks_unique, labels_unique
+except: pass
+
+fig, ax = plt.subplots(figsize=(6, 5))
+for t in ticks:
+    ax.axvline(x=t, color='black', linestyle='--', linewidth=1.0, alpha=0.7, zorder=1)
+ax.axhline(y=0, color='black', linestyle='--', linewidth=1.0, alpha=0.7, zorder=1)
+
+num_energy_cols = energies.shape[1]
+lw = 1.5
+color_nm = 'blue'        
+color_up = 'blue'        
+color_down = 'green'     
+
+if is_fm:
+    num_bands = num_energy_cols // 2
+    for i in range(num_bands):
+        ax.plot(k_path, energies[:, 2*i], color=color_up, linewidth=lw, zorder=2)
+        ax.plot(k_path, energies[:, 2*i+1], color=color_down, linewidth=lw, zorder=2)
+else:
+    for i in range(num_energy_cols):
+        ax.plot(k_path, energies[:, i], color=color_nm, linewidth=lw, zorder=2)
+
+ax.set_xlim(k_path.min(), k_path.max())
+ax.set_xticks(ticks)
+ax.set_xticklabels(labels, fontsize=16)
+ax.set_xlabel("")
+ax.tick_params(axis='x', length=0) 
+
+ax.set_ylim(ymin, ymax)
+ax.set_ylabel("Energy (eV)", fontsize=16)
+ax.set_yticks(np.arange(ymin, ymax + 0.1, ystep))
+ax.tick_params(axis='y', labelsize=14, length=0) 
+ax.margins(x=0, y=0)
+
+plt.tight_layout()
+plt.savefig(output_file, dpi=300, bbox_inches='tight')
+EOF
+
+python3 "$PYTHON_SCRIPT"
+rm "$PYTHON_SCRIPT"
+'''
+
+# ==============================================================================
+# 2. 辅助函数定义
+# ==============================================================================
+def modify_incar(incar_path, modifications):
+    if not os.path.exists(incar_path): 
+        c_log(f"Warning: INCAR 丢失 ({incar_path})!", "WARN")
+        return
+    with open(incar_path, 'r') as f: lines = f.readlines()
+    new_lines = []
+    updated_keys = {k: False for k in modifications.keys()}
+    for line in lines:
+        stripped = line.strip()
+        if '=' in stripped and not stripped.startswith('#') and not stripped.startswith('!'):
+            key = stripped.split('=')[0].strip().upper()
+            if key in modifications:
+                new_lines.append(f" {key} = {modifications[key]}\n")
+                updated_keys[key] = True
+                continue
+        new_lines.append(line)
+    for key, val in modifications.items():
+        if not updated_keys[key]: new_lines.append(f" {key} = {val}\n")
+    with open(incar_path, 'w') as f: f.writelines(new_lines)
+    # 取消了细碎的修改日志输出，以保持主界面整洁
+
+def extract_nbands(outcar_path):
+    with open(outcar_path, 'r') as f:
+        for line in f:
+            if 'NBANDS' in line:
+                match = re.search(r'NBANDS\s*=\s*(\d+)', line)
+                if match:
+                    nbands = int(match.group(1))
+                    return nbands
+    raise ValueError("无法在 OUTCAR 中找到 NBANDS！")
+
+def write_and_chmod(filepath, content):
+    with open(filepath, 'w') as f: f.write(content.strip() + "\n")
+    st = os.stat(filepath)
+    os.chmod(filepath, st.st_mode | stat.S_IEXEC)
+
+def run_vaspkit(task_id, cwd):
+    # 将 vaspkit 的输出完全静默，避免终端和日志杂乱
+    subprocess.run(["vaspkit"], input=f"{task_id}\n", text=True, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+# ==============================================================================
+# 3. 主工作流
+# ==============================================================================
+def main():
+    root_dir = os.getcwd()
+    scf_dir = os.path.join(root_dir, "scf")
+    banddos_dir = os.path.join(scf_dir, "band+dos")
+
+    # ------------------ 初始化 ------------------
+    open("workflow.log", "w").close() 
+    c_log("=== VASP FULL AUTOMATION WORKFLOW STARTED ===", "ITER")
+
+    # --- 第一阶段：SCF ---
+    c_log("", "INFO")
+    c_log(">>> 第一阶段：SCF 静态自洽计算 <<<", "ITER")
+    os.makedirs(scf_dir, exist_ok=True)
+    
+    for f in ["CONTCAR", "INCAR", "KPOINTS", "POTCAR", "wk.pbs"]:
+        src = os.path.join(root_dir, f)
+        if os.path.exists(src): shutil.copy(src, scf_dir)
+        else:
+            c_log(f"错误: 根目录下缺少关键输入文件 {f}", "ERROR")
+            return
+            
+    os.rename(os.path.join(scf_dir, "CONTCAR"), os.path.join(scf_dir, "POSCAR"))
+    modify_incar(os.path.join(scf_dir, "INCAR"), {"NSW": "0", "IBRION": "-1", "LCHARG": "T"})
+    write_and_chmod(os.path.join(scf_dir, "vasp_infinite_wait.py"), VASP_INFINITE_WAIT_SCRIPT)
+    
+    c_log("正在后台运行 SCF 任务，请耐心等待...", "INFO")
+    with open(os.path.join(scf_dir, "stdout.log"), "w") as out_log:
+        subprocess.run(["python3", "-u", "vasp_infinite_wait.py"], cwd=scf_dir, stdout=out_log, stderr=subprocess.STDOUT)
+    c_log("SCF 任务已完成！", "SUCCESS")
+
+    old_nbands = extract_nbands(os.path.join(scf_dir, "OUTCAR"))
+    new_nbands = old_nbands + 60
+    c_log(f"解析 OUTCAR：提取 NBANDS = {old_nbands}，扩展目标 NBANDS = {new_nbands}", "DATA")
+
+    # --- 第二阶段：BAND + DOS ---
+    c_log("", "INFO")
+    c_log(">>> 第二阶段：BAND + DOS 联合计算 <<<", "ITER")
+    os.makedirs(banddos_dir, exist_ok=True)
+
+    for f in ["CONTCAR", "POTCAR", "INCAR", "KPOINTS", "CHGCAR", "wk.pbs"]:
+        src = os.path.join(scf_dir, f)
+        if os.path.exists(src): shutil.copy(src, banddos_dir)
+        else:
+            c_log(f"错误: SCF 目录未找到 {f}，前置计算可能已崩塌。", "ERROR")
+            return
+
+    os.rename(os.path.join(banddos_dir, "CONTCAR"), os.path.join(banddos_dir, "POSCAR"))
+    
+    c_log("正在调用 Vaspkit 生成 KPATH...", "INFO")
+    run_vaspkit("302", banddos_dir)
+    kpath_file = os.path.join(banddos_dir, "KPATH.in")
+    if os.path.exists(kpath_file): shutil.copy(kpath_file, os.path.join(banddos_dir, "KPOINTS"))
+    else:
+        c_log("错误: vaspkit 302 未能生成 KPATH.in", "ERROR")
+        return
+
+    modify_incar(os.path.join(banddos_dir, "INCAR"), {
+        "ICHARG": "11", "LCHARG": "F", "NEDOS": "601",
+        "EMAX": "8", "EMIN": "-8", "NBANDS": str(new_nbands)
+    })
+
+    write_and_chmod(os.path.join(banddos_dir, "vasp_infinite_wait.py"), VASP_INFINITE_WAIT_SCRIPT)
+    
+    c_log("正在后台运行 BAND+DOS 任务，请耐心等待...", "INFO")
+    with open(os.path.join(banddos_dir, "stdout.log"), "w") as out_log:
+        subprocess.run(["python3", "-u", "vasp_infinite_wait.py"], cwd=banddos_dir, stdout=out_log, stderr=subprocess.STDOUT)
+    c_log("BAND+DOS 任务已完成！", "SUCCESS")
+
+    # --- 第三阶段：数据处理 ---
+    c_log("", "INFO")
+    c_log(">>> 第三阶段：数据提取与自动绘图 <<<", "ITER")
+    
+    write_and_chmod(os.path.join(banddos_dir, "doscal"), DOSCAL_SCRIPT)
+    write_and_chmod(os.path.join(banddos_dir, "bandcal"), BANDCAL_SCRIPT)
+
+    c_log("提取 DOS 矩阵并绘制 PDOS...", "INFO")
+    run_vaspkit("116", banddos_dir)
+    subprocess.run(["./doscal"], cwd=banddos_dir, stdout=subprocess.DEVNULL)
+
+    c_log("提取能带本征值并绘制 Band Structure...", "INFO")
+    run_vaspkit("211", banddos_dir)
+    subprocess.run(["./bandcal"], cwd=banddos_dir, stdout=subprocess.DEVNULL)
+    c_log("图像渲染结束！", "SUCCESS")
+
+    # --- 第四阶段：整理出图文件 ---
+    c_log("", "INFO")
+    c_log(">>> 第四阶段：成果打包归档 <<<", "ITER")
+    png_dat_dir = os.path.join(banddos_dir, "png_dat")
+    os.makedirs(png_dat_dir, exist_ok=True)
+
+    files_to_move = ["band_structure.png", "PDOS_final_v4.png", "BAND.dat"]
+    pdos_pattern = os.path.join(banddos_dir, "PDOS_*.dat")
+    for f in glob.glob(pdos_pattern): files_to_move.append(os.path.basename(f))
+
+    moved_count = 0
+    for file_name in set(files_to_move):
+        src = os.path.join(banddos_dir, file_name)
+        dst = os.path.join(png_dat_dir, file_name)
+        if os.path.exists(src):
+            shutil.move(src, dst)
+            moved_count += 1
+
+    c_log(f"已将 {moved_count} 个结果文件安全归档至 png_dat/ 文件夹。", "SUCCESS")
+
+    c_log("", "INFO")
+    c_log("=== 全部自动化任务圆满结束 ===", "SUCCESS")
+
+if __name__ == "__main__":
+    main()
+EOF_PYTHON
+
+echo "======================================================"
+echo -e "\033[92m[✓]\033[0m Python 工作流核心 (vasp_workflow.py) 生成完毕。"
+echo "======================================================"
+echo "正在通过 nohup 自动将工作流提交至后台运行..."
+echo "计算及绘图过程中所有的日志将同步输出到 : workflow.log"
+echo "------------------------------------------------------"
+
+# 使用 nohup 后台提交该脚本
+nohup python3 -u vasp_workflow.py > workflow.log 2>&1 &
+PID=$!
+
+echo -e "\033[92m[OK]\033[0m 任务已成功在后台启动！ (后台 PID: ${PID})"
+echo "你可以随时使用以下命令查看简明扼要的进度："
+echo -e "\033[1;35m  tail -f workflow.log \033[0m"
+echo "======================================================"
+
+
+

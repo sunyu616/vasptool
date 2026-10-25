@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# 从 VASP OUTCAR 中找出最后一个离子步里受力最大的原子
+# 用法: ./maxforce.sh [OUTCAR路径]
+# 默认读取当前目录下的 OUTCAR
+
+set -euo pipefail
+
+file="${1:-OUTCAR}"
+
+if [[ ! -f "$file" ]]; then
+    echo "错误: 找不到文件: $file" >&2
+    echo "用法: $0 [OUTCAR路径]" >&2
+    exit 1
+fi
+
+awk '
+/TOTAL-FORCE/ {
+    inblock = 1
+    natom = 0
+    max = 0
+    atom = 0
+    mfx = 0
+    mfy = 0
+    mfz = 0
+    next
+}
+inblock && NF >= 6 && $1 ~ /^[+-]?[0-9]/ {
+    natom++
+    fx = $4
+    fy = $5
+    fz = $6
+    f = sqrt(fx * fx + fy * fy + fz * fz)
+
+    if (f > max) {
+        max = f
+        atom = natom
+        mfx = fx
+        mfy = fy
+        mfz = fz
+    }
+    next
+}
+inblock && NF == 0 {
+    inblock = 0
+}
+END {
+    if (atom == 0) {
+        print "错误: 未找到 TOTAL-FORCE 数据" > "/dev/stderr"
+        exit 1
+    }
+    printf "最大受力: %.8f eV/Angstrom\n", max
+    printf "原子编号: %d\n", atom
+    printf "力分量: %.8f %.8f %.8f eV/Angstrom\n", mfx, mfy, mfz
+}
+' "$file"

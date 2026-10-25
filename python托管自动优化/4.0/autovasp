@@ -1,0 +1,520 @@
+#!/bin/bash
+set -euo pipefail
+
+FILENAME="vasp_infinite_wait.py"
+
+if ! command -v python3 &> /dev/null; then
+    echo "⚠️  错误：未找到 python3。请加载 Anaconda 或 Python 模块。"
+    exit 1
+fi
+
+echo "正在生成脚本: $FILENAME (包含超胞逆向重构与 POTCAR 防错) ..."
+
+cat << 'EOF' > "${FILENAME}"
+import os
+import time
+import subprocess
+import shutil
+import numpy as np
+import sys
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+from email.header import Header
+
+# --- 尝试导入可视化库 ---
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_PLOT = True
+except ImportError:
+    HAS_PLOT = False
+
+# --- 尝试导入对称性与建模库 ---
+HAS_SYMMETRY_LIB = False
+try:
+    import ase
+    from ase.io import read, write
+    import spglib
+    from ase import Atoms
+    from ase.build import make_supercell  # 引入超胞重构工具
+    HAS_SYMMETRY_LIB = True
+except ImportError:
+    HAS_SYMMETRY_LIB = False
+
+# ================== 1. 用户配置区域 ==================
+
+SCRIPT_MODE = 'OPT'  # 'OPT' (优化) 或 'MONITOR' (仅监视)
+
+# --- 💎 对称性保护 (阶梯式匹配) ---
+ENABLE_SYMMETRY = True      
+TOLERANCE_SWEEP = [0.001, 0.01, 0.1, 0.2, 0.5] 
+
+# --- 同步模式 ---
+SYNC_MODE = 'None'   # 'None': 独立, 'AB': a=b, 'ABC': a=b=c
+
+# --- 优化开关 ---
+OPT_A = True
+OPT_B = True
+OPT_C = False
+
+# --- 📧 邮件配置 ---
+ENABLE_EMAIL = True
+SMTP_SERVER = "smtp.qq.com"
+SMTP_PORT = 465
+SENDER_EMAIL = "your_qq_number@qq.com"
+SENDER_PASSWORD = "在此填入QQ邮箱授权码"
+RECEIVER_EMAIL = "your_qq_number@qq.com"
+
+# --- 🏗️ 任务管理 ---
+SUBMIT_CMD = "qsub wk.pbs"      
+CHECK_CMD = "qstat"             
+JOB_ID_REGEX = r"(\d+)\.master" 
+MAX_RETRIES = 3         
+
+# --- ⏳ 等待策略 ---
+MIN_CHECK_INTERVAL = 5     
+MAX_CHECK_INTERVAL = 60    
+
+# --- ⚛️ 收敛标准 ---
+TARGET_TOLERANCE = 1.0  
+MAX_ITER = 20           
+MAX_STRAIN_PER_STEP = 0.04  
+
+# --- 🧠 初始柔度 (Alpha) ---
+INITIAL_ALPHA = 0.0005 
+MIN_ALPHA = 0.0001
+MAX_ALPHA = 0.0050
+
+# ================== 2. 强制日志引擎与全局变量 ==================
+
+def c_log(msg, level="INFO"):
+    t_str = time.strftime('%Y-%m-%d %H:%M:%S')
+    line = f"{t_str} | [{level}] {msg}"
+    print(line, flush=True) 
+    try:
+        with open("auto_opt.log", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except: pass
+
+history_db = []
+current_alphas = np.array([INITIAL_ALPHA, INITIAL_ALPHA, INITIAL_ALPHA])
+
+# ================== 3. 核心检测与对称性功能 ==================
+
+def enforce_symmetry(file_path="POSCAR", is_final=False):
+    if not ENABLE_SYMMETRY: return False
+    if not HAS_SYMMETRY_LIB:
+        c_log("⚠️ 未找到 ase/spglib，跳过对称性处理。(pip install ase spglib)", "WARN")
+        return False
+        
+    try:
+        if not os.path.exists(file_path):
+            c_log(f"⚠️ 找不到 {file_path}，跳过。", "WARN")
+            return False
+            
+        atoms = read(file_path)
+        
+        # 记录原 POSCAR 的元素区块顺序 (POTCAR 防错)
+        orig_symbols = atoms.get_chemical_symbols()
+        orig_order = []
+        for sym in orig_symbols:
+            if sym not in orig_order: orig_order.append(sym)
+                
+        cell_tuple = (atoms.get_cell(), atoms.get_scaled_positions(), atoms.get_atomic_numbers())
+        
+        best_dataset = None
+        best_symprec = TOLERANCE_SWEEP[0]
+        
+        # 阶梯式扫描容差
+        for tol in TOLERANCE_SWEEP:
+            dataset = spglib.get_symmetry_dataset(cell_tuple, symprec=tol)
+            if dataset is not None:
+                if dataset['number'] > 1:
+                    best_dataset = dataset
+                    best_symprec = tol
+                    break
+                elif best_dataset is None:
+                    best_dataset = dataset
+                    
+        if best_dataset is not None:
+            point_group = best_dataset['pointgroup']
+            space_group = f"{best_dataset['international']} ({best_dataset['number']})"
+            prefix = "最终结构" if is_final else "当前结构"
+            c_log(f"🔮 [{prefix}对称性] 采用容差: {best_symprec} | 点群: {point_group} | 空间群: {space_group}")
+        else:
+            c_log("⚠️ [对称性] 无法识别任何晶体信息。", "WARN")
+            return False
+        
+        std_cell = spglib.standardize_cell(cell_tuple, to_primitive=False, no_idealize=False, symprec=best_symprec)
+        
+        if std_cell is not None:
+            new_lattice, new_positions, new_numbers = std_cell
+            
+            # 【高级特性：超胞逆向重构】
+            if len(new_numbers) < len(atoms):
+                c_log(f"⚙️  [超胞处理] 识别到超胞 (原 {len(atoms)} 原子 -> 标准晶胞 {len(new_numbers)} 原子)。正在执行完美重构...")
+                
+                C_orig = atoms.get_cell()
+                C_std = new_lattice
+                # 计算变换矩阵 P = C_orig * inv(C_std)
+                P = np.dot(C_orig, np.linalg.inv(C_std))
+                P_int = np.round(P).astype(int)
+                
+                # 校验变换矩阵，防止因剧烈形变导致错误的扩胞
+                if np.max(np.abs(P - P_int)) > 0.05:
+                    c_log(f"⚠️ 晶胞变换矩阵偏离整数过大 (偏差 {np.max(np.abs(P - P_int)):.3f})，可能发生严重畸变，跳过对称化。", "WARN")
+                    return False
+                    
+                std_atoms = Atoms(numbers=new_numbers, cell=new_lattice, scaled_positions=new_positions, pbc=True)
+                
+                # 核心：使用算出的 P 矩阵将完美对称的晶胞精确扩胞回原样
+                final_atoms = make_supercell(std_atoms, P_int)
+                
+                if len(final_atoms) != len(atoms):
+                    c_log(f"⚠️ 重构后原子数不符 ({len(final_atoms)} != {len(atoms)})，放弃写入。", "WARN")
+                    return False
+                c_log(f"✅ [超胞处理] 重构成功！已将对称性平滑映射至原超胞尺寸。")
+            else:
+                final_atoms = Atoms(numbers=new_numbers, cell=new_lattice, scaled_positions=new_positions, pbc=True)
+            
+            # 【POTCAR 防错机制】强制按照老 POSCAR 的元素顺序给原子排队
+            sorted_indices = []
+            for sym in orig_order:
+                for i, atom in enumerate(final_atoms):
+                    if atom.symbol == sym:
+                        sorted_indices.append(i)
+            final_atoms = final_atoms[sorted_indices]
+            
+            write(file_path, final_atoms, format='vasp', vasp5=True)
+            
+            if is_final:
+                c_log(f"💎 最终结构已标准化并完美覆盖至 {file_path}。")
+            else:
+                c_log(f"💎 已标准化 {file_path} (元素排序已校准) 并覆盖。")
+            return True
+        else:
+            c_log(f"⚠️ 标准化失败，保留原始 {file_path}。", "WARN")
+            return False
+            
+    except Exception as e:
+        c_log(f"⚠️ 对称性处理时发生严重错误: {e}", "ERROR")
+        return False
+
+def run_cmd(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8', errors='ignore').strip()
+    except: return ""
+
+def get_nelm_from_incar():
+    nelm = 60
+    if os.path.exists("INCAR"):
+        try:
+            with open("INCAR", 'r') as f:
+                for line in f:
+                    if "NELM" in line and "=" in line:
+                        val = re.search(r"NELM\s*=\s*(\d+)", line)
+                        if val: nelm = int(val.group(1))
+        except: pass
+    return nelm
+
+def check_electronic_convergence():
+    if not os.path.exists("OSZICAR"): return True 
+    nelm = get_nelm_from_incar()
+    last_steps = 0
+    try:
+        with open("OSZICAR", 'r') as f:
+            lines = f.readlines()
+            for line in reversed(lines):
+                if "DAV:" in line or "RMM:" in line:
+                    parts = line.split()
+                    if len(parts) > 1: last_steps = int(parts[1])
+                    break
+    except: pass
+
+    if last_steps >= nelm:
+        c_log(f"!! 电子步未收敛: 达到最大步数 NELM ({nelm})。", "WARN")
+        return False
+    return True
+
+def check_job_success():
+    if not os.path.exists("OUTCAR"): return False
+    try:
+        fsize = os.path.getsize("OUTCAR")
+        if fsize == 0: return False
+        with open("OUTCAR", 'rb') as f:
+            f.seek(max(0, fsize - 51200))
+            if "General timing" in f.read().decode('utf-8', errors='ignore'):
+                return True
+    except: pass
+    return False
+
+def submit_job():
+    out = run_cmd(SUBMIT_CMD)
+    match = re.search(JOB_ID_REGEX, out)
+    if match: return match.group(1)
+    alt = re.search(r"(\d+)", out)
+    return alt.group(1) if alt else None
+
+def is_job_running(job_id):
+    out = run_cmd(CHECK_CMD)
+    if job_id not in out: return False
+    for line in out.splitlines():
+        if job_id in line and re.search(r"\s[CE]\s|\s[CE]$", line): return False
+    return True
+
+def wait_job(job_id):
+    c_log(f">> 正在监控任务 [{job_id}]...")
+    time.sleep(MIN_CHECK_INTERVAL)
+    curr = MIN_CHECK_INTERVAL
+    while is_job_running(job_id):
+        time.sleep(curr)
+        curr = min(curr * 1.2, MAX_CHECK_INTERVAL)
+    c_log(f">> 任务 [{job_id}] 运行结束。")
+    time.sleep(5)
+
+# ================== 4. 可视化与邮件 ==================
+
+def generate_optimization_plot():
+    if not HAS_PLOT or not history_db: return None
+    try:
+        iters = [d['iter'] for d in history_db]
+        s_xx = [d['stress'][0] for d in history_db]
+        s_yy = [d['stress'][1] for d in history_db]
+        s_zz = [d['stress'][2] for d in history_db]
+        
+        plt.figure(figsize=(8, 5))
+        plt.plot(iters, s_xx, 'r-o', label='Stress XX')
+        plt.plot(iters, s_yy, 'g-s', label='Stress YY')
+        plt.plot(iters, s_zz, 'b-^', label='Stress ZZ')
+        
+        plt.axhline(y=TARGET_TOLERANCE, color='k', linestyle='--', alpha=0.3)
+        plt.axhline(y=-TARGET_TOLERANCE, color='k', linestyle='--', alpha=0.3)
+        plt.axhline(y=0, color='k', linestyle='-', alpha=0.5)
+        
+        plt.title('VASP Optimization History')
+        plt.xlabel('Iteration')
+        plt.ylabel('Stress (kB)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        img_name = "opt_progress.png"
+        plt.savefig(img_name)
+        plt.close()
+        return img_name
+    except Exception as e:
+        c_log(f"绘图失败: {e}", "ERROR")
+        return None
+
+def send_email(status, start_time, iter_count=0, stress=None):
+    if not ENABLE_EMAIL: return
+    current_dir = os.getcwd()
+    duration = time.time() - start_time
+    m, s = divmod(duration, 60)
+    h, m = divmod(m, 60)
+    
+    msg = MIMEMultipart()
+    subject = f"[VASP] {status}"
+    
+    if SCRIPT_MODE == 'OPT':
+        s_str = f"XX={stress[0]:.2f}, YY={stress[1]:.2f}, ZZ={stress[2]:.2f}" if stress is not None else "N/A"
+        body = (f"Optimization Status: {status}\n"
+                f"Work Dir: {current_dir}\n"
+                f"Duration: {int(h)}h {int(m)}m {int(s)}s\n"
+                f"Iterations: {iter_count}\n"
+                f"Final Stress (kB): {s_str}\n")
+        subject += f" (Iter {iter_count})"
+        
+        img_path = generate_optimization_plot()
+        if img_path and os.path.exists(img_path):
+            try:
+                with open(img_path, 'rb') as f: img_data = f.read()
+                image = MIMEImage(img_data, name=os.path.basename(img_path))
+                msg.attach(image)
+                body += "\n[Attachment] Optimization plot attached.\n"
+            except: pass
+    else:
+        body = (f"Job Status: {status}\n"
+                f"Work Dir: {current_dir}\n"
+                f"Duration: {int(h)}h {int(m)}m\n")
+
+    msg['Subject'] = Header(subject, 'utf-8')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECEIVER_EMAIL
+    msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+    try:
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], msg.as_string())
+        server.quit()
+        c_log(">> 邮件发送成功。")
+    except Exception as e:
+        c_log(f"!! 邮件发送失败: {e}", "ERROR")
+
+# ================== 5. 优化逻辑 ==================
+
+def read_stress_kb():
+    if not os.path.exists("OUTCAR"): return None
+    try:
+        with open("OUTCAR", 'r') as f:
+            for line in reversed(f.readlines()):
+                if "in kB" in line:
+                    parts = line.split()
+                    try: return np.array([float(parts[2]), float(parts[3]), float(parts[4])])
+                    except: continue
+    except: pass
+    return None
+
+def calculate_next_strain(current_stress):
+    global current_alphas, history_db
+    strains = np.zeros(3)
+    for i in range(3):
+        if len(history_db) >= 1:
+            prev = history_db[-1]
+            d_stress = abs(current_stress[i] - prev['stress'][i])
+            d_strain = abs(prev['strain'][i])
+            if d_stress > 0.5:
+                new_alpha = max(MIN_ALPHA, min(d_strain / d_stress, MAX_ALPHA))
+                current_alphas[i] = 0.7 * new_alpha + 0.3 * current_alphas[i]
+
+        mag = abs(current_stress[i]) * current_alphas[i]
+        val = mag if current_stress[i] > 0 else -mag
+        
+        if len(history_db) >= 1 and current_stress[i] * history_db[-1]['stress'][i] < 0: val *= 0.5
+        if abs(val) > MAX_STRAIN_PER_STEP: val = np.sign(val) * MAX_STRAIN_PER_STEP
+        strains[i] = val
+    return strains
+
+def update_poscar(current_stress):
+    if not os.path.exists("CONTCAR") or os.path.getsize("CONTCAR") < 10: return False
+    shutil.copy2("CONTCAR", "POSCAR")
+    
+    try:
+        with open("POSCAR", 'r') as f: lines = f.readlines()
+        vecs = [np.array([float(x) for x in lines[i].split()]) for i in range(2, 5)]
+    except: return False
+
+    eff_stress = np.copy(current_stress)
+    if SYNC_MODE == 'AB':
+        mean_val = np.mean(eff_stress[:2])
+        eff_stress[0] = eff_stress[1] = mean_val
+    elif SYNC_MODE == 'ABC':
+        mean_val = np.mean(eff_stress[:3])
+        eff_stress[:3] = mean_val
+
+    strains = calculate_next_strain(eff_stress)
+    
+    if SYNC_MODE == 'AB': strains[0] = strains[1] = np.mean(strains[:2])
+    elif SYNC_MODE == 'ABC': strains[:] = np.mean(strains)
+
+    history_db.append({'iter': len(history_db)+1, 'stress': np.copy(eff_stress), 'strain': np.copy(strains)})
+
+    flags = [OPT_A, OPT_B, OPT_C]
+    for i in range(3):
+        if flags[i]: vecs[i] = vecs[i] * (1.0 + strains[i])
+        lines[2+i] = f" {vecs[i][0]:22.16f} {vecs[i][1]:22.16f} {vecs[i][2]:22.16f}\n"
+
+    shutil.copy2("POSCAR", "POSCAR_backup_prev")
+    with open("POSCAR", 'w') as f: f.writelines(lines)
+    return True
+
+# ================== 6. 主程序 ==================
+
+def main():
+    start_t = time.time()
+    open("auto_opt.log", "w").close() 
+    
+    c_log("=== VASP ENHANCED OPTIMIZER ===")
+    sym_status = "开启 (全能守护: 阶梯容差+超胞重构+POTCAR防错)" if ENABLE_SYMMETRY else "关闭"
+    lib_status = "已安装" if HAS_SYMMETRY_LIB else "未安装(缺失)"
+    c_log(f"对称性保护状态: {sym_status} (依赖库: {lib_status})")
+    
+    if SCRIPT_MODE == 'MONITOR':
+        enforce_symmetry("POSCAR") 
+        job_id = submit_job()
+        if job_id:
+            wait_job(job_id)
+            status = "Success" if check_job_success() else "Failed"
+            send_email(status, start_t)
+
+    elif SCRIPT_MODE == 'OPT':
+        final_status = "Failed"
+        stress = None
+        
+        for i in range(1, MAX_ITER + 1):
+            c_log(f"\n======== 迭代周期 Iteration {i} / {MAX_ITER} ========")
+            
+            success = False
+            for retry in range(MAX_RETRIES + 1):
+                enforce_symmetry("POSCAR") 
+                
+                job_id = submit_job()
+                if not job_id: 
+                    time.sleep(30)
+                    continue
+                    
+                wait_job(job_id)
+                
+                if not check_job_success():
+                    c_log(f"!! 任务未正常结束 (重试 {retry}/{MAX_RETRIES}).", "WARN")
+                    if retry < MAX_RETRIES and os.path.exists("CONTCAR") and os.path.getsize("CONTCAR")>0:
+                        shutil.copy2("CONTCAR", "POSCAR")
+                        continue
+                    else: break
+
+                if not check_electronic_convergence():
+                    c_log("!! 电子步未收敛，计算结果无效跳出。", "ERROR")
+                    break 
+                
+                success = True
+                break
+            
+            if not success:
+                final_status = "Aborted (Job/Elec Fail)"
+                break
+            
+            stress = read_stress_kb()
+            if stress is None: break
+            
+            c_log(f"📊 当前应力 (Stress XX,YY,ZZ in kB): {stress}")
+            
+            converged = True
+            if OPT_A and abs(stress[0]) > TARGET_TOLERANCE: converged = False
+            if OPT_B and abs(stress[1]) > TARGET_TOLERANCE: converged = False
+            if OPT_C and abs(stress[2]) > TARGET_TOLERANCE: converged = False
+            
+            shutil.copy2("OUTCAR", f"OUTCAR_iter_{i}")
+            
+            if converged:
+                final_status = "Converged"
+                c_log("🎉 达到收敛标准！结束优化。")
+                history_db.append({'iter': i, 'stress': stress, 'strain': np.zeros(3)})
+                break
+            
+            if i < MAX_ITER:
+                if not update_poscar(stress): break
+            else:
+                final_status = "Max Iter Reached"
+
+        if ENABLE_SYMMETRY and os.path.exists("CONTCAR") and os.path.getsize("CONTCAR") > 10:
+            c_log("\n--- 开始处理最终 CONTCAR 对称性 ---")
+            enforce_symmetry("CONTCAR", is_final=True)
+
+        send_email(final_status, start_t, i, stress)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+if [ -f "${FILENAME}" ]; then
+    chmod +x "${FILENAME}"
+    echo "✅ 成功生成: ${FILENAME}"
+    echo "📝 脚本路径: $(pwd)/${FILENAME}"
+    echo "💡 运行建议: nohup python3 -u ${FILENAME} > auto_opt.log 2>&1 &"
+else
+    echo "❌ 生成失败"
+fi

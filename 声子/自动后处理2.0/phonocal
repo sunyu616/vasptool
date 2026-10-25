@@ -1,0 +1,429 @@
+#!/bin/bash
+
+# ==================================================================
+# Phonopy 全自动计算与绘图脚本 (综合合体版)
+# 
+# [阶段一：自动准备]
+# 1. 自动调用 vaspkit 302 提取路径，动态生成 BAND 和 BAND_LABELS
+# 2. 自动对比 POSCAR 和超胞算出 DIM 扩胞倍数 (去除引号)
+# 3. 严格生成包含特定参数的 band.conf
+#
+# [阶段二：计算与绘图 (V3 最终修正版内核)]
+# 1. 解析 band.yaml 时 list index out of range 崩溃问题修复
+# 2. 兼容 segment_nqpoint 的多行/单行格式
+# 3. 完美匹配标签和参考线并出图
+# ==================================================================
+
+set -e
+
+# ==================================================================
+# 阶段一：自动推算参数并生成 band.conf
+# ==================================================================
+echo "========================================"
+echo "[Phase 1] 开始自动推算参数并生成 band.conf..."
+echo "========================================"
+
+# --- 1. 调用 vaspkit 302 ---
+if command -v vaspkit &> /dev/null; then
+    echo "-> 正在调用 vaspkit 302 生成 KPATH.in..."
+    # 自动输入 302 并按回车
+    echo -e "302\n" | vaspkit > /dev/null 2>&1
+    if [ ! -f "KPATH.in" ]; then
+        echo "错误：vaspkit 302 未能生成 KPATH.in，请检查原胞结构文件或环境。"
+        exit 1
+    fi
+else
+    echo "错误：未检测到 vaspkit 命令，请确保已正确加载 vaspkit 环境变量。"
+    exit 1
+fi
+
+# --- 2. 注入 Python 脚本自动计算 DIM 并读取 KPATH.in 生成 band.conf ---
+cat << 'EOF' > prep_band.py
+import math
+import glob
+import os
+import sys
+
+# --- 步骤 A: 自动获取 DIM ---
+dim_str = ""
+# 1. 优先从 phonopy_disp.yaml 读取
+if os.path.exists("phonopy_disp.yaml"):
+    with open("phonopy_disp.yaml", "r") as f:
+        for line in f:
+            if "dim:" in line:
+                # 提取并强力去除所有的括号、逗号、单双引号
+                raw_dim = line.split(":")[1]
+                dim_str = raw_dim.replace("[","").replace("]","").replace(","," ").replace('"',"").replace("'","").strip()
+                print(f"-> 成功从 phonopy_disp.yaml 提取 DIM: {dim_str}")
+                break
+
+# 2. 如果没找到 yaml，通过对比 POSCAR 和超胞晶格向量计算
+if not dim_str:
+    if not os.path.exists("POSCAR"):
+        print("错误：未找到原胞 POSCAR 文件，无法推算 DIM。")
+        sys.exit(1)
+
+    # 寻找扩胞文件 (POSCAR-00x 或是 SPOSCAR)
+    displaced_poscars = glob.glob("POSCAR-00[1-9]") + glob.glob("SPOSCAR")
+    if not displaced_poscars:
+        print("错误：未找到 Phonopy 生成的超胞文件 (如 POSCAR-001 或 SPOSCAR)。")
+        sys.exit(1)
+    
+    displaced = sorted(displaced_poscars)[0]
+
+    def get_lattice_vectors(filename):
+        with open(filename, 'r') as f:
+            lines = f.readlines()
+            try:
+                scale = float(lines[1].strip())
+                if scale < 0: scale = 1.0 # 如果是负数(体积)，设为1简化比值计算
+            except ValueError:
+                scale = 1.0
+            v1 = [float(x)*scale for x in lines[2].split()]
+            v2 = [float(x)*scale for x in lines[3].split()]
+            v3 = [float(x)*scale for x in lines[4].split()]
+        return v1, v2, v3
+
+    def vec_len(v):
+        return math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
+
+    v1_orig, v2_orig, v3_orig = get_lattice_vectors("POSCAR")
+    v1_super, v2_super, v3_super = get_lattice_vectors(displaced)
+
+    # 四舍五入计算各方向的倍数
+    dim_x = max(1, round(vec_len(v1_super) / vec_len(v1_orig)))
+    dim_y = max(1, round(vec_len(v2_super) / vec_len(v2_orig)))
+    dim_z = max(1, round(vec_len(v3_super) / vec_len(v3_orig)))
+    dim_str = f"{dim_x} {dim_y} {dim_z}"
+    print(f"-> 成功对比晶格推算出 DIM: {dim_str} (基于 {displaced} 与 POSCAR)")
+
+# --- 步骤 B: 解析 KPATH.in 生成 BAND 和 BAND_LABELS ---
+coords = []
+labels = []
+with open("KPATH.in", "r") as f:
+    lines = f.readlines()
+    start = False
+    for line in f.readlines() if not lines else lines:
+        if "Reciprocal" in line or "RECIPROCAL" in line.upper():
+            start = True
+            continue
+        if start:
+            parts = line.strip().split()
+            if len(parts) >= 4:
+                # 保持原始输出，不做小数截断
+                c = f"{parts[0]} {parts[1]} {parts[2]}"
+                l = parts[3]
+                
+                # 将 GAMMA 或 G 替换为 LaTeX 格式
+                if l.upper() in ["GAMMA", "G"]:
+                    l = r"\Gamma"
+                coords.append(c)
+                labels.append(l)
+
+if not coords:
+    print("错误：未能在 KPATH.in 中提取到高对称点坐标！")
+    sys.exit(1)
+
+# 处理连线与断点（按 Phonopy 的规则组合坐标）
+final_coords = []
+final_labels = []
+
+final_coords.append(coords[0])
+final_labels.append(labels[0])
+for i in range(1, len(coords), 2):
+    final_coords.append(coords[i])
+    final_labels.append(labels[i])
+    if i + 1 < len(coords):
+        # 判断下一段的起点是否和上一段的终点重合，不重合则代表路径不连续，需加逗号
+        if coords[i] != coords[i+1]:
+            final_coords.append(",")
+            final_labels.append(",")
+            final_coords.append(coords[i+1])
+            final_labels.append(labels[i+1])
+
+# 拼装字符串
+band_str = ""
+for c in final_coords:
+    if c == ",":
+        band_str = band_str.strip() + ", "
+    else:
+        band_str += c + "  "
+
+band_labels_str = ""
+for l in final_labels:
+    if l != ",":
+        band_labels_str += l + " "
+
+# --- 步骤 C: 写入符合用户要求的 band.conf ---
+with open("band.conf", "w") as f:
+    f.write('EIGENVECTORS = .TRUE.\n')
+    f.write(f'DIM = {dim_str}\n')
+    f.write('FORCE_CONSTRAINS = READ\n')
+    f.write(f'BAND = {band_str.strip()}\n')
+    f.write(f'BAND_LABELS = {band_labels_str.strip()}\n')
+    f.write('BAND_POINTS = 101\n')
+    f.write('BAND_CONNECTION = .FALSE.\n')
+    f.write('FC_SYMMETRY = 181\n')
+    f.write('GROUP_VELOCITY = .TRUE.\n')
+
+print("-> band.conf 文件已成功生成！\n")
+EOF
+
+# --- 3. 运行 Python 脚本并清理 ---
+python3 prep_band.py
+rm prep_band.py
+
+
+# ==================================================================
+# 阶段二：计算与后处理绘图 (原有 V3 脚本逻辑)
+# ==================================================================
+echo "========================================"
+echo "[Phase 2] 开始力常数计算与能带后处理绘图"
+echo "========================================"
+
+# === Step 1: 检测文件 ===
+echo "[Step 1] 检测 vasprun.xml..."
+files=$(ls -v [0-9][0-9]/vasprun.xml 2>/dev/null)
+
+if [ -z "$files" ]; then
+    echo "错误：未找到 01-NN/vasprun.xml 文件夹。"
+    exit 1
+fi
+
+phonopy -f $(echo $files)
+echo "FORCE_SETS 生成完毕。"
+
+# === Step 2: 计算 band.yaml ===
+echo "[Step 2] 计算 band.yaml..."
+if [ ! -f "band.conf" ]; then
+    echo "错误：未找到 band.conf。"
+    exit 1
+fi
+phonopy band.conf > /dev/null
+
+# === Step 3: 导出数据 ===
+echo "[Step 3] 导出绘图数据..."
+dim_line=$(grep -i "DIM" band.conf)
+dim_suffix=$(echo "$dim_line" | awk -F= '{print $2}' | tr -d '[:space:]')
+data_file="phono${dim_suffix}.dat"
+bandplot --gnuplot > "$data_file"
+
+# === Step 4: Python 绘图 (V3 强壮内核) ===
+echo "[Step 4] 生成 Python 脚本并绘图..."
+
+python_script="plot_v3.py"
+image_file="phonon_dispersion.png"
+
+cat << 'EOF' > "$python_script"
+import matplotlib.pyplot as plt
+import numpy as np
+import sys
+
+# --- 样式设置 ---
+plt.rcParams['text.usetex'] = False
+plt.rcParams['mathtext.fontset'] = 'cm'
+plt.rcParams['font.family'] = 'STIXGeneral'
+plt.rcParams['font.size'] = 14
+plt.rcParams['axes.linewidth'] = 1.2
+
+data_file = sys.argv[1]
+output_file = sys.argv[2]
+conf_file = "band.conf"
+yaml_file = "band.yaml"
+
+# ==========================================
+# 核心函数：健壮的 YAML 解析器
+# ==========================================
+def get_ticks_and_labels():
+    """
+    不依赖第三方库，手动解析 band.yaml 和 band.conf
+    """
+    ticks = []
+    
+    # 1. 解析 segment_nqpoint (每段的点数)
+    segments = []
+    try:
+        with open(yaml_file, 'r') as f:
+            lines = f.readlines()
+            
+        # 寻找 segment_nqpoint
+        for i, line in enumerate(lines):
+            if "segment_nqpoint:" in line:
+                # 情况 A: 单行格式 [ 51, 51 ]
+                if '[' in line:
+                    content = line.split('[')[1].split(']')[0]
+                    # 替换逗号，按空格分割
+                    segments = [int(x) for x in content.replace(',', ' ').split()]
+                # 情况 B: 多行格式
+                # - 51
+                # - 51
+                else:
+                    j = i + 1
+                    while j < len(lines):
+                        l_strip = lines[j].strip()
+                        if l_strip.startswith('-'):
+                            try:
+                                # 去掉 '-' 并转整数
+                                val = int(l_strip.lstrip('- ').strip())
+                                segments.append(val)
+                            except ValueError:
+                                break
+                        else:
+                            break # 列表结束
+                        j += 1
+                break
+        
+        if not segments:
+            print("Warning: 无法在 band.yaml 中找到 segment_nqpoint")
+            return None, None
+
+        # 2. 提取所有 distance 值
+        # 这是一个简单的正则提取，为了效率我们只提取包含 'distance:' 的行
+        distances = []
+        for line in lines:
+            if "distance:" in line:
+                try:
+                    # 格式通常为 "  distance:   0.000000"
+                    d = float(line.split(':')[1].strip())
+                    distances.append(d)
+                except ValueError:
+                    continue
+        
+        if not distances:
+            print("Warning: 无法在 band.yaml 中提取 distance")
+            return None, None
+
+        # 3. 根据 segments 计算 ticks 位置
+        # 逻辑：
+        # 第1个点: distances[0]
+        # 第2个点: distances[n1 - 1] (第一段终点)
+        # 第3个点: distances[n1 + n2 - 1] (第二段终点)
+        # ...
+        
+        current_idx = 0
+        
+        # 添加起点
+        if len(distances) > 0:
+            ticks.append(distances[0])
+            
+        for n in segments:
+            current_idx += n
+            # 防止索引越界
+            idx = min(current_idx - 1, len(distances) - 1)
+            ticks.append(distances[idx])
+            
+        # 去重 (可选，但为了保持和 Labels 数量对应，通常不去重)
+        print(f"Debug: 解析到 Segments: {segments}")
+        print(f"Debug: 计算出 Ticks 位置: {ticks}")
+
+    except Exception as e:
+        print(f"Error parsing band.yaml: {e}")
+        return None, None
+
+    # 4. 解析 Labels (band.conf)
+    labels = []
+    try:
+        with open(conf_file, 'r') as f:
+            for line in f:
+                if "BAND_LABELS" in line:
+                    content = line.split('=')[1].strip()
+                    raw_labels = content.split()
+                    for l in raw_labels:
+                        clean_l = l.replace("'", "").replace('"', "")
+                        if clean_l.startswith("\\"): 
+                            labels.append(r"$%s$" % clean_l)
+                        elif clean_l in ["G", "Gamma", "GAMMA"]:
+                            labels.append(r"$\Gamma$")
+                        else:
+                            labels.append(clean_l)
+    except Exception:
+        pass
+        
+    return ticks, labels
+
+# ==========================================
+# 主程序
+# ==========================================
+
+# 1. 获取坐标和标签
+ticks, labels = get_ticks_and_labels()
+
+# 2. 读取绘图数据 (只负责画线)
+segments_x = []
+segments_y = []
+current_x = []
+current_y = []
+
+try:
+    with open(data_file, 'r') as f:
+        for line in f:
+            if line.strip() == "":
+                if len(current_x) > 0:
+                    segments_x.append(np.array(current_x))
+                    segments_y.append(np.array(current_y))
+                    current_x = []
+                    current_y = []
+                continue
+            try:
+                parts = [float(x) for x in line.split()]
+                current_x.append(parts[0])
+                current_y.append(parts[1:])
+            except ValueError:
+                continue
+    if len(current_x) > 0:
+        segments_x.append(np.array(current_x))
+        segments_y.append(np.array(current_y))
+except FileNotFoundError:
+    print("Error: Data file not found.")
+    sys.exit(1)
+
+# 如果解析 YAML 失败，回退到数据极值 (保底)
+if ticks is None or len(ticks) < 2:
+    print("Warning: 使用数据极值作为坐标范围（解析失败）")
+    all_x = np.concatenate(segments_x) if segments_x else [0, 1]
+    ticks = [np.min(all_x), np.max(all_x)]
+
+# 3. 绘图
+fig, ax = plt.subplots(figsize=(8, 6))
+
+# A. 画红线 (数据)
+for sx, sy in zip(segments_x, segments_y):
+    ax.plot(sx, sy, color='#d62728', linewidth=1.5, alpha=0.9)
+
+# B. 画参考线
+for t in ticks:
+    ax.axvline(x=t, color='black', linestyle='--', linewidth=1.0, alpha=0.7)
+
+ax.axhline(y=0, color='black', linestyle='--', linewidth=1.0, alpha=0.7)
+
+# C. 设置坐标轴
+ax.set_xlim(ticks[0], ticks[-1])
+ax.set_xticks(ticks)
+
+# D. 设置标签
+if labels and len(labels) == len(ticks):
+    ax.set_xticklabels(labels, fontsize=16)
+else:
+    print(f"Info: Labels ({len(labels) if labels else 0}) vs Ticks ({len(ticks)}) mismatch.")
+    if labels:
+        # 尽力显示
+        display_n = min(len(labels), len(ticks))
+        ax.set_xticklabels(labels[:display_n], fontsize=16)
+
+ax.set_xlabel("")
+ax.set_ylabel("Frequency (THz)", fontsize=16)
+ax.tick_params(axis='y', labelsize=14)
+ax.tick_params(axis='x', length=0) # 隐藏刻度线
+
+plt.tight_layout()
+plt.savefig(output_file, dpi=300, bbox_inches='tight')
+print(f"Success: Plot saved to {output_file}")
+EOF
+
+python3 "$python_script" "$data_file" "$image_file"
+# rm "$python_script"
+
+echo "----------------------------------------"
+echo "全部流程执行完毕！图形已生成！"
+echo "----------------------------------------"
+

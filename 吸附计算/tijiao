@@ -1,0 +1,27 @@
+#!/bin/bash
+# 遍历当前目录下所有的文件夹 (格式为 ./*/)
+for dir in ./*/
+do
+    # 检查是否存在目录 (防止当前目录下没有任何文件夹时报错)
+    if [ -d "$dir" ]; then
+        
+        # 获取文件夹的名称 (去掉路径中的 ./ 和尾部的 /)
+        dirname=$(basename "$dir")
+        
+        echo "----------------------------------------"
+        echo "正在处理文件夹: $dirname"
+        
+        # 1. 进入文件夹
+        cd "$dir" || exit
+		frozen
+        cp POSCAR_frozen POSCAR
+        rm POSCAR_frozen 
+        sed -i "55,56s/F/T/g" POSCAR
+        qsub wk.pbs
+        cd ..
+        echo "文件夹 $dirname 处理完成。"
+    fi
+done
+
+echo "----------------------------------------"
+echo "所有文件夹遍历结束！"

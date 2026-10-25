@@ -1,0 +1,204 @@
+#!/bin/bash
+
+# ==================================================================
+# Vaspkit PDOS 绘图脚本 (V4 绝对稳健版)
+# 修复：
+# 1. 强制 DW 数据翻转：无论原数据正负，强制 Spin Down 为负值 (位于下方)
+# 2. 调试信息：会在终端打印出数据的最大/最小值，方便排查
+# 3. 画布比例: 10:5 (宽屏)
+# ==================================================================
+
+set -e
+
+# --- 1. 文件检测 ---
+MODE="UNKNOWN"
+FILE_NM="PDOS_ELEMENTS.dat"
+FILE_UP="PDOS_ELEMENTS_UP.dat"
+FILE_DW="PDOS_ELEMENTS_DW.dat"
+DATA_LINES=0
+
+echo "Checking files..."
+
+if [[ -f "$FILE_UP" && -f "$FILE_DW" ]]; then
+    MODE="FM"
+    DATA_LINES=$(grep -v "#" "$FILE_UP" | grep -v "^$" | wc -l)
+    echo "Mode: Spin-Polarized (FM)"
+    echo "Files: $FILE_UP & $FILE_DW"
+elif [[ -f "$FILE_NM" ]]; then
+    MODE="NM"
+    DATA_LINES=$(grep -v "#" "$FILE_NM" | grep -v "^$" | wc -l)
+    echo "Mode: Non-Magnetic (NM)"
+else
+    echo "Error: No PDOS files found."
+    exit 1
+fi
+
+echo "Data points: $DATA_LINES"
+
+# --- 2. 生成 Python 脚本 ---
+PYTHON_SCRIPT="plot_pdos_v4.py"
+OUTPUT_IMG="PDOS_final_v4.png"
+
+cat << EOF > "$PYTHON_SCRIPT"
+import matplotlib.pyplot as plt
+import numpy as np
+import sys
+from scipy.interpolate import make_interp_spline
+
+# === A. 样式与配色 ===
+colors = ['#E64B35', '#4DBBD5', '#00A087', '#3C5488', 
+          '#F39B7F', '#8491B4', '#91D1C2', '#DC0000']
+
+plt.rcParams['text.usetex'] = False
+plt.rcParams['mathtext.fontset'] = 'cm'
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
+plt.rcParams['font.size'] = 14
+plt.rcParams['axes.linewidth'] = 1.5
+
+# === B. 参数 ===
+mode = "$MODE"
+xlim_val = 3.0
+raw_points = int("$DATA_LINES")
+
+# === C. 平滑函数 ===
+def smooth_data(x, y, mult=10):
+    if len(x) < 4: return x, y
+    try:
+        x_new = np.linspace(x.min(), x.max(), len(x) * mult)
+        spl = make_interp_spline(x, y, k=3)
+        y_new = spl(x_new)
+        # 修正：将极小的负值噪音置为 0 (仅针对 DOS 幅值)
+        y_new = np.maximum(y_new, 0)
+        return x_new, y_new
+    except:
+        return x, y
+
+# === D. 数据读取 ===
+def read_pdos(filename):
+    try:
+        with open(filename, 'r') as f:
+            header = f.readline().strip()
+        cols = header.replace('#', '').split()
+        labels = cols[1:]
+        data = np.loadtxt(filename)
+        return data[:, 0], data[:, 1:], labels
+    except Exception as e:
+        sys.exit(f"Error reading {filename}: {e}")
+
+# === E. 数据处理 (强制翻转逻辑) ===
+dos_dict = {}
+elements = []
+
+if mode == "NM":
+    eng, data, lbls = read_pdos("$FILE_NM")
+    elements = lbls
+    for i, elem in enumerate(elements):
+        x_sm, y_sm = smooth_data(eng, data[:, i])
+        dos_dict[elem] = {'x': x_sm, 'y': y_sm}
+
+elif mode == "FM":
+    eng_u, data_u, lbls_u = read_pdos("$FILE_UP")
+    eng_d, data_d, lbls_d = read_pdos("$FILE_DW")
+    
+    # 截断长度不一致
+    min_len = min(len(eng_u), len(eng_d))
+    eng_u = eng_u[:min_len]
+    data_u = data_u[:min_len]
+    eng_d = eng_d[:min_len]
+    data_d = data_d[:min_len]
+
+    elements = lbls_u
+    
+    print(f"Debug: Processing {len(elements)} elements...")
+
+    for i, elem in enumerate(elements):
+        # 1. Spin Up: 直接平滑
+        xu_sm, yu_sm = smooth_data(eng_u, data_u[:, i])
+        
+        # 2. Spin Down: 绝对强制翻转
+        # 第一步：取绝对值 (变成正的)
+        raw_dw_abs = np.abs(data_d[:, i])
+        
+        # 第二步：对正值进行平滑 (避免 0 附近的震荡)
+        xd_sm, yd_sm_abs = smooth_data(eng_d, raw_dw_abs)
+        
+        # 第三步：乘以 -1 (变成负的)
+        yd_sm = -1.0 * yd_sm_abs
+        
+        # 调试打印：检查是否真的变负了
+        print(f"  Element {elem}: Up Max={np.max(yu_sm):.2f}, Dw Min={np.min(yd_sm):.2f}")
+        
+        dos_dict[elem] = {
+            'x_up': xu_sm, 'y_up': yu_sm,
+            'x_dw': xd_sm, 'y_dw': yd_sm
+        }
+
+# === F. 自动 Y 轴范围 ===
+max_val = 0.0
+for elem in elements:
+    if mode == "NM":
+        d = dos_dict[elem]
+        mask = (d['x'] >= -xlim_val) & (d['x'] <= xlim_val)
+        if np.any(mask):
+            max_val = max(max_val, np.max(d['y'][mask]))
+    elif mode == "FM":
+        d = dos_dict[elem]
+        mask_u = (d['x_up'] >= -xlim_val) & (d['x_up'] <= xlim_val)
+        mask_d = (d['x_dw'] >= -xlim_val) & (d['x_dw'] <= xlim_val)
+        
+        if np.any(mask_u): max_val = max(max_val, np.max(d['y_up'][mask_u]))
+        # 比较绝对值
+        if np.any(mask_d): max_val = max(max_val, np.max(np.abs(d['y_dw'][mask_d])))
+
+if max_val < 0.1: max_val = 1.0
+limit = max_val * 1.1
+
+# 强制 FM 模式 Y 轴包含负区间
+ymin, ymax = (0, limit) if mode == "NM" else (-limit, limit)
+
+print(f"Debug: Y-axis range set to [{ymin:.2f}, {ymax:.2f}]")
+
+# === G. 绘图 ===
+fig, ax = plt.subplots(figsize=(10, 5))
+
+# 参考线
+ax.axvline(x=0, color='gray', linestyle='--', linewidth=1.0, alpha=0.8)
+ax.axhline(y=0, color='black', linewidth=0.8, alpha=0.5)
+
+for i, elem in enumerate(elements):
+    col = colors[i % len(colors)]
+    
+    if mode == "NM":
+        d = dos_dict[elem]
+        ax.plot(d['x'], d['y'], color=col, linewidth=1.5, label=elem)
+        ax.fill_between(d['x'], 0, d['y'], color=col, alpha=0.2)
+        
+    elif mode == "FM":
+        d = dos_dict[elem]
+        # Spin Up
+        ax.plot(d['x_up'], d['y_up'], color=col, linewidth=1.5, label=elem)
+        ax.fill_between(d['x_up'], 0, d['y_up'], color=col, alpha=0.2)
+        
+        # Spin Down
+        ax.plot(d['x_dw'], d['y_dw'], color=col, linewidth=1.5)
+        ax.fill_between(d['x_dw'], 0, d['y_dw'], color=col, alpha=0.2)
+
+ax.set_xlim(-xlim_val, xlim_val)
+ax.set_ylim(ymin, ymax)
+
+ax.set_xlabel('Energy', fontsize=16)
+ax.set_ylabel('PDOS', fontsize=16)
+
+ax.legend(frameon=False, fontsize=12, loc='best')
+
+plt.tight_layout()
+plt.savefig("$OUTPUT_IMG", dpi=300, bbox_inches='tight')
+print(f"Plot saved to $OUTPUT_IMG")
+EOF
+
+# --- 3. 运行 ---
+python3 "$PYTHON_SCRIPT"
+rm "$PYTHON_SCRIPT"
+echo "Done."
+

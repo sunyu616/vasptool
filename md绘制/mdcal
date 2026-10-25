@@ -1,0 +1,127 @@
+#!/bin/bash
+
+# ============================================================
+# VASP MD Plotter (Centered & Clean Style)
+# 功能：
+# 1. 提取数据生成 md.dat
+# 2. 绝对居中：以平均能量为基准，对称设置Y轴
+# 3. 去除右侧和上侧刻度，保留边框
+# ============================================================
+
+# --- 1. 数据提取 ---
+
+if [ ! -f OSZICAR ]; then
+    echo "错误: 未找到 OSZICAR 文件！"
+    exit 1
+fi
+
+echo "正在生成数据文件 md.dat ..."
+
+# 写入表头
+echo "# Step    Energy(eV)" > md.dat
+
+# 提取 Step 和 Energy
+grep "T=" OSZICAR | awk '{printf "%-8s %s\n", $1, $5}' >> md.dat
+
+if [ ! -s md.dat ]; then
+    echo "错误: 数据提取失败。"
+    rm md.dat
+    exit 1
+fi
+
+# --- 2. Python 绘图 ---
+
+cat << 'EOF' > plot_script.py
+import matplotlib.pyplot as plt
+import numpy as np
+import matplotlib.ticker as ticker
+
+# 1. 读取数据
+try:
+    data = np.loadtxt('md.dat', comments='#')
+    steps = data[:, 0]
+    energies = data[:, 1]
+except Exception as e:
+    print(f"读取失败: {e}")
+    exit(1)
+
+# 2. 数据转换
+# X轴：转换单位为 x10^3
+steps_scaled = steps / 1000.0
+
+# 3. 智能居中算法 (Smart Centering)
+# 计算平均值和最大偏差
+e_mean = np.mean(energies)
+e_max_dev = np.max(np.abs(energies - e_mean))
+
+# 如果波动极小（几乎是直线），给一个默认范围
+if e_max_dev == 0:
+    e_max_dev = 1.0
+
+# 设定 Y 轴范围：为了让曲线看起来"趋于直线"，我们需要给予足够的空间
+# 这里的 2.0 系数意味着留白比数据波动本身还大，视觉上会压缩波动，显得更稳
+padding_factor = 10.0 
+y_span = e_max_dev * padding_factor
+
+# 确定最终的 Y 轴上下限 (关于平均值严格对称)
+y_limit_min = e_mean - y_span
+y_limit_max = e_mean + y_span
+
+# 4. Nature/Science 风格配置
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'DejaVu Sans']
+plt.rcParams['font.size'] = 11
+plt.rcParams['axes.linewidth'] = 1.2
+plt.rcParams['lines.linewidth'] = 1.0
+plt.rcParams['xtick.direction'] = 'in'
+plt.rcParams['ytick.direction'] = 'in'
+plt.rcParams['xtick.major.width'] = 1.0
+plt.rcParams['ytick.major.width'] = 1.0
+
+# 5. 创建画布
+# 3.5 英寸宽 (单栏)
+fig, ax = plt.subplots(figsize=(3.5, 2.8), dpi=300)
+
+# 配色：使用 Cell/Nature 常用的深钴蓝
+academic_blue = '#205CA5' 
+
+# 绘制曲线
+ax.plot(steps_scaled, energies, color=academic_blue, alpha=0.9)
+
+# 绘制一条淡淡的平均线（虚线），辅助视觉居中（可选）
+ax.axhline(y=e_mean, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+
+# 6. 坐标轴设置
+# X轴：0 起始
+ax.set_xlim(0, np.max(steps_scaled))
+
+# Y轴：应用对称居中范围
+ax.set_ylim(y_limit_min, y_limit_max)
+
+# --- 关键修改：刻度线控制 ---
+# top=False (上刻度关), right=False (右刻度关)
+# left=True, bottom=True (保留左下刻度)
+ax.tick_params(top=False, right=False, left=True, bottom=True, which='both')
+
+# 标签
+ax.set_xlabel(r'Time Step ($\times 10^3$)', fontweight='bold')
+ax.set_ylabel('Total Energy (eV)', fontweight='bold')
+
+# 刻度值智能优化
+# 使用 MaxNLocator 自动寻找"漂亮的整数或小数"作为刻度
+ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=5))
+ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=4)) 
+
+plt.tight_layout()
+
+# 保存
+output_file = 'MD_Energy_Centered.png'
+plt.savefig(output_file, dpi=300, bbox_inches='tight')
+print(f"绘图完成: {output_file}")
+print(f"Y轴范围已锁定: {y_limit_min:.2f} ~ {y_limit_max:.2f} (Center: {e_mean:.2f})")
+EOF
+
+# --- 3. 执行 ---
+python3 plot_script.py
+rm plot_script.py
+

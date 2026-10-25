@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# 定义已知的所有文件名称列表（用于比对排除）
+ALL_KNOWN_FILES=("INCAR" "KPOINTS" "POTCAR" "wk.pbs" "vasp_infinite_wait.py" "POSCAR")
+# 必须存在的文件（用于检测报警）
+REQUIRED_FILES=("INCAR" "KPOINTS" "POTCAR" "wk.pbs")
+
+# 开启 nullglob，防止当前目录下没有文件夹时把 "*/" 当作字符串处理
+shopt -s nullglob
+
+# 遍历当前目录下的每一个文件夹
+for dir in */; do
+    if [ -d "$dir" ]; then
+        echo "--------------------------------------------------"
+        echo "进入文件夹: $dir"
+        
+        # 进入该文件夹
+        cd "$dir" || continue
+
+        # 1. 检测必须的文件
+        for req_file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$req_file" ]; then
+                echo "  [-] 警告: 缺少 $req_file"
+            else
+                echo "  [+] 正常: 找到 $req_file"
+            fi
+        done
+
+        # 2. 检测可选文件 (仅做提示)
+        if [ -f "vasp_infinite_wait.py" ]; then
+            echo "  [+] 正常: 找到可选文件 vasp_infinite_wait.py"
+        fi
+
+        # 3. 核心逻辑：检测与处理 POSCAR
+        if [ -f "POSCAR" ]; then
+            echo "  [+] 正常: 找到 POSCAR"
+        else
+            echo "  [!] 未找到 POSCAR，正在寻找未命名的结构文件..."
+            renamed=false
+            
+            # 遍历当前文件夹下的所有文件
+            for file in *; do
+                # 确保是文件且不是目录
+                if [ -f "$file" ]; then
+                    is_known=false
+                    
+                    # 检查该文件是否在已知名称列表中
+                    for known in "${ALL_KNOWN_FILES[@]}"; do
+                        if [ "$file" == "$known" ]; then
+                            is_known=true
+                            break
+                        fi
+                    done
+                    
+                    # 如果不是上述名称中的任何一个，则执行重命名
+                    if [ "$is_known" = false ]; then
+                        echo "  [=>] 执行操作: 将 '$file' 重命名为 'POSCAR'"
+                        mv "$file" "POSCAR"
+                        renamed=true
+                        break # 仅重命名找到的第一个符合条件的文件，随后跳出循环
+                    fi
+                fi
+            done
+            
+            if [ "$renamed" = false ]; then
+                echo "  [X] 错误: 文件夹中没有可以用来重命名为 POSCAR 的其他文件。"
+            fi
+        fi
+
+        # 退回到上一级目录，准备进入下一个文件夹
+        cd ..
+    fi
+done
+
+echo "--------------------------------------------------"
+echo "所有文件夹检测和处理完毕！"
+

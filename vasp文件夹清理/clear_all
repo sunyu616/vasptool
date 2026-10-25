@@ -1,0 +1,48 @@
+#!/bin/bash
+
+# 定义要保留的文件列表
+KEEP_FILES=("INCAR" "POSCAR" "POTCAR" "KPOINTS" "wk.pbs" )
+
+echo "准备清理当前目录..."
+echo "以下文件将被保留: ${KEEP_FILES[*]}"
+echo "----------------------------------------"
+
+# 创建一个临时数组来存储待删除的文件
+TO_DELETE=()
+
+# 遍历当前目录下的所有文件
+for file in *; do
+    # 跳过目录，只处理文件
+    if [ -f "$file" ]; then
+        skip=0
+        # 检查文件是否在保留列表中
+        for keep in "${KEEP_FILES[@]}"; do
+            if [ "$file" == "$keep" ] || [ "$file" == "$0" ]; then
+                skip=1
+                break
+            fi
+        done
+        
+        # 如果不在保留列表中，加入删除队列
+        if [ $skip -eq 0 ]; then
+            TO_DELETE+=("$file")
+        fi
+    fi
+done
+
+if [ ${#TO_DELETE[@]} -eq 0 ]; then
+    echo "没有需要删除的文件。"
+    exit 0
+fi
+
+# 列出将要删除的文件
+echo "警告：以下文件将被删除："
+for f in "${TO_DELETE[@]}"; do
+    echo "  - $f"
+done
+echo "----------------------------------------"
+
+# 确认删除
+    rm "${TO_DELETE[@]}"
+    echo "清理完成。"
+

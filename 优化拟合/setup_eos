@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# ====================================================
+# 脚本功能：批量建立EOS计算文件夹并修改POSCAR缩放系数
+# 前提条件：
+# 1. 目录下必须有 INCAR, KPOINTS, POTCAR, POSCAR
+# 2. 原始 POSCAR 的第2行建议为 1.0 (如果是具体晶格常数，会被覆盖)
+# ====================================================
+
+# 检查基础文件是否存在
+for file in INCAR KPOINTS POTCAR POSCAR; do
+    if [ ! -f "$file" ]; then
+        echo "Error: $file does not exist in current directory!"
+        exit 1
+    fi
+done
+
+echo "Starting EOS setup..."
+
+# 使用 seq 生成序列 (起点 步长 终点)
+# seq -f "%.2f" 保证输出格式为两位小数 (如 0.95, 1.00)
+for i in $(seq -f "%.2f" 0.95 0.01 1.05)
+do
+    echo "Processing scale factor: $i"
+
+    # 1. 建立文件夹
+    mkdir -p "$i"
+
+    # 2. 复制四个输入文件到文件夹中
+    cp INCAR KPOINTS POTCAR POSCAR wk.pbs "$i/"
+
+    # 3. 修改 POSCAR 第2行
+    # sed -i: 直接修改文件
+    # "2s/.*/$i/": 匹配第2行(2s)，将该行所有内容(.*)替换为变量i的值($i)
+    sed -i "2s/.*/$i/" "$i/POSCAR"
+    
+done
+
+echo "----------------------------------------"
+echo "All folders created from 0.95 to 1.05."
+echo "Ready to submit jobs!"
+

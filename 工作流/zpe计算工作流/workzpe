@@ -1,0 +1,377 @@
+#!/bin/bash
+
+# ==============================================================================
+# 1. 备份并创建 zpe 目录 (模拟 cp2 命令)
+# ==============================================================================
+echo "========================================= "
+echo ">>> [步骤 1] 正在创建 zpe 目录并复制基础文件..."
+echo "========================================= "
+
+if [ ! -f "CONTCAR" ] || [ ! -f "INCAR" ] || [ ! -f "POTCAR" ] || [ ! -f "KPOINTS" ] || [ ! -f "wk.pbs" ]; then
+    echo "❌ 错误: 当前目录下缺少必要的 VASP 输入文件！"
+    exit 1
+fi
+
+mkdir -p zpe
+
+ISPIN_VAL=$(python3 -c "
+import re, os
+ispin = '1'
+if os.path.exists('INCAR'):
+    with open('INCAR', 'r') as f:
+        for line in f:
+            pure_line = re.sub(r'[#!].*', '', line).strip()
+            if 'ISPIN' in pure_line.upper():
+                match = re.search(r'ISPIN\s*=\s*(\d+)', pure_line, re.IGNORECASE)
+                if match: ispin = match.group(1); break
+print(ispin)
+" 2>/dev/null)
+
+if [ -z "$ISPIN_VAL" ]; then ISPIN_VAL="1"; fi
+echo ">>> 已成功安全获取原始 ISPIN 继承值 = $ISPIN_VAL"
+
+cp CONTCAR INCAR POTCAR KPOINTS wk.pbs zpe/
+cd zpe/ || exit 1
+
+# ==============================================================================
+# 2. 读取 CONTCAR 并生成冻结 POSCAR (替代 a.out)
+# ==============================================================================
+echo ""
+echo "========================================= "
+echo ">>> [步骤 2] 读取 CONTCAR 并生成选择性动力学 POSCAR..."
+echo "========================================= "
+
+CURRENT_PATH=$(pwd)
+
+python3 -c "
+import os, sys
+
+curr_path = \"$CURRENT_PATH\"
+unfreeze_num = 0
+
+path_upper = curr_path.upper()
+if 'OOH' in path_upper: unfreeze_num = 3
+elif 'OH' in path_upper: unfreeze_num = 2
+elif 'H' in path_upper: unfreeze_num = 1
+
+print(f'>>> 系统决策: 冻结衬底原子，解冻末尾 {unfreeze_num} 个原子。')
+
+if not os.path.exists('CONTCAR') or os.path.getsize('CONTCAR') < 10:
+    print('❌ 错误: CONTCAR 不存在或为空！'); sys.exit(1)
+
+try:
+    with open('CONTCAR', 'r') as f:
+        lines = [line.strip() for line in f.readlines() if line.strip()]
+        
+    v5_mode = True
+    try:
+        list(map(int, lines[5].split()))
+        v5_mode = False 
+    except ValueError: pass
+        
+    num_line_idx = 6 if v5_mode else 5
+    atom_counts = list(map(int, lines[num_line_idx].split()))
+    total_atoms = sum(atom_counts)
+    
+    header = lines[:num_line_idx + 1]
+    header.append('Selective dynamics')
+    
+    coord_type = 'Direct'
+    search_start = num_line_idx + 1
+    for idx in range(search_start, len(lines)):
+        if lines[idx].upper().startswith(('D', 'C')):
+            coord_type = 'Cartesian' if lines[idx].upper().startswith('C') else 'Direct'
+            search_start = idx + 1
+            break
+    header.append(coord_type)
+    
+    coords = []
+    for line in lines[search_start:]:
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                [float(x) for x in parts[:3]]
+                coords.append(parts[:3])
+            except ValueError: pass
+        if len(coords) == total_atoms: break
+
+    with open('POSCAR', 'w') as f:
+        for h in header: f.write(h + '\n')
+        for i in range(total_atoms):
+            x, y, z = coords[i]
+            if unfreeze_num > 0 and i >= total_atoms - unfreeze_num:
+                f.write(f' {x:>16} {y:>16} {z:>16}   T   T   T\n')
+            else:
+                f.write(f' {x:>16} {y:>16} {z:>16}   F   F   F\n')
+                
+    print('>>> 🎉 POSCAR 生成完毕！')
+except Exception as e:
+    print(f'❌ 转换失败: {e}')
+"
+
+# ==============================================================================
+# 3. 写入新 INCAR 并继承原有 ISPIN 值
+# ==============================================================================
+echo ""
+echo "========================================= "
+echo ">>> [步骤 3] 写入新 INCAR 并同步 ISPIN 属性..."
+echo "========================================= "
+
+rm -f INCAR
+
+cat << 'EOF' > INCAR
+   ISTART = 0
+   ICHARG = 2
+
+   IBRION = 5
+   ISIF= 2
+   NSW   = 1
+   POTIM =0.02
+   NFREE =2
+
+   GGA = PE
+   ISPIN = 1
+ 
+   PREC   = N
+   ADDGRID= T
+   EDIFF  = 1.0e-5
+   EDIFFG = -0.02
+   
+   ENCUT  = 450
+   NELM   = 100
+   NELMIN = 2
+   ISMEAR = 0
+   SIGMA  = 0.01
+   LWAVE = F
+   LCHARG = F
+   IALGO  = 48
+   LORBIT = 11
+   LREAL = Auto
+   ISYM = 0
+
+   IVDW=11
+   VDW_RADIUS=50.2
+   VDW_CNRADIUS=20.0
+EOF
+
+if [ -n "$ISPIN_VAL" ]; then
+    if grep -q -i '^[[:space:]]*ISPIN' INCAR; then
+        sed -i "s/^[[:space:]]*ISPIN.*/   ISPIN = $ISPIN_VAL/g" INCAR
+    else
+        echo "   ISPIN = $ISPIN_VAL" >> INCAR
+    fi
+fi
+
+# ==============================================================================
+# 4. 生成 vasp_infinite_wait.py (100% 还原原版邮件发送逻辑)
+# ==============================================================================
+echo ""
+echo "========================================= "
+echo ">>> [步骤 4] 生成 vasp_infinite_wait.py ..."
+echo "========================================= "
+
+cat << 'EOF' > vasp_infinite_wait.py
+import os
+import time
+import subprocess
+import shutil
+import numpy as np
+import sys
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+from email.header import Header
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_PLOT = True
+except ImportError:
+    HAS_PLOT = False
+
+HAS_SYMMETRY_LIB = False
+
+# ================== 1. USER CONFIGURATION ==================
+SCRIPT_MODE = 'MONITOR'  
+ENABLE_SYMMETRY = False # 加速监控流程        
+
+ENABLE_EMAIL = True                  
+SMTP_SERVER = "smtp.qq.com"          
+SMTP_PORT = 465                      
+SENDER_EMAIL = "your_qq_number@qq.com"    
+SENDER_PASSWORD = "在此填入QQ邮箱授权码" 
+RECEIVER_EMAIL = "your_qq_number@qq.com"  
+
+SUBMIT_CMD = "qsub wk.pbs"      
+CHECK_CMD = "qstat"             
+JOB_ID_REGEX = r"(\d+)\.master" 
+MAX_RETRIES = 3                 
+MIN_CHECK_INTERVAL = 5     
+MAX_CHECK_INTERVAL = 60    
+
+class LogColors:
+    RESET = "\033[0m"
+    SUCCESS = "\033[92m"   
+    ERROR = "\033[91m"     
+    ITER = "\033[1;35m"    
+    DATA = "\033[94m"      
+
+def c_log(msg, level="INFO"):
+    if not msg:
+        try:
+            with open("auto_opt.log", "a", encoding="utf-8") as f: f.write("\n")
+        except: pass
+        return
+    t_str = time.strftime('%m-%d %H:%M:%S')
+    color = ""
+    if level == "ERROR": color = LogColors.ERROR
+    elif level == "SUCCESS": color = LogColors.SUCCESS
+    
+    color_suffix = LogColors.RESET if color else ""
+    colored_line = f"{color}{t_str} | [{level:^7}] {msg}{color_suffix}"
+    print(colored_line, flush=True) 
+    try:
+        with open("auto_opt.log", "a", encoding="utf-8") as f: f.write(f"{t_str} | [{level:^7}] {msg}\n")
+    except: pass
+
+def run_cmd(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8', errors='ignore').strip()
+    except: return ""
+
+def get_nelm_from_incar():
+    nelm = 60
+    if os.path.exists("INCAR"):
+        try:
+            with open("INCAR", 'r') as f:
+                for line in f:
+                    if "NELM" in line and "=" in line:
+                        val = re.search(r"NELM\s*=\s*(\d+)", line)
+                        if val: nelm = int(val.group(1))
+        except: pass
+    return nelm
+
+def check_electronic_convergence():
+    if not os.path.exists("OSZICAR"): return True 
+    nelm = get_nelm_from_incar()
+    last_steps = 0
+    try:
+        with open("OSZICAR", 'r') as f:
+            lines = f.readlines()
+            for line in reversed(lines):
+                if "DAV:" in line or "RMM:" in line:
+                    parts = line.split()
+                    if len(parts) > 1: last_steps = int(parts[1])
+                    break
+    except: pass
+    if last_steps >= nelm: return False
+    return True
+
+def check_job_success():
+    if not os.path.exists("OUTCAR"): return False
+    try:
+        fsize = os.path.getsize("OUTCAR")
+        if fsize == 0: return False
+        with open("OUTCAR", 'rb') as f:
+            f.seek(max(0, fsize - 51200))
+            if "General timing" in f.read().decode('utf-8', errors='ignore'): return True
+    except: pass
+    return False
+
+def submit_job():
+    out = run_cmd(SUBMIT_CMD)
+    match = re.search(JOB_ID_REGEX, out)
+    if match: return match.group(1)
+    alt = re.search(r"(\d+)", out)
+    return alt.group(1) if alt else None
+
+def is_job_running(job_id):
+    out = run_cmd(CHECK_CMD)
+    if job_id not in out: return False
+    for line in out.splitlines():
+        if job_id in line and re.search(r"\s[CE]\s|\s[CE]$", line): return False
+    return True
+
+def wait_job(job_id):
+    c_log(f"Job [{job_id}] queued/running. Monitoring...", "INFO")
+    time.sleep(MIN_CHECK_INTERVAL)
+    curr = MIN_CHECK_INTERVAL
+    while is_job_running(job_id):
+        time.sleep(curr)
+        curr = min(curr * 1.2, MAX_CHECK_INTERVAL)
+    c_log(f"Job [{job_id}] finished execution.", "SUCCESS")
+    time.sleep(5)
+
+# --- 100% 原版邮件发送逻辑 (完全撤销之前的改动) ---
+def send_email(status, start_time, iter_count=0, stress=None):
+    if not ENABLE_EMAIL: return
+    duration = time.time() - start_time
+    m, s = divmod(duration, 60)
+    h, m = divmod(m, 60)
+    
+    msg = MIMEMultipart()
+    
+    if SCRIPT_MODE == 'OPT':
+        pass # 此工作流下仅使用 MONITOR
+    else:
+        subject = f"[VASP Monitor] {status}"
+        body = (f"Status: {status}\n"
+                f"WorkDir: {os.getcwd()}\n"
+                f"Duration: {int(h)}h {int(m)}m {int(s)}s\n")
+
+    msg['Subject'] = Header(subject, 'utf-8')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECEIVER_EMAIL
+    msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+    try:
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], msg.as_string())
+        server.quit()
+        c_log("Email notification sent.", "SUCCESS")
+    except Exception as e:
+        c_log(f"Email failed: {e}", "ERROR")
+
+def main():
+    start_t = time.time()
+    open("auto_opt.log", "w").close() 
+    c_log("=== VASP MONITOR STARTED ===", "ITER")
+    
+    jid = submit_job()
+    if jid: 
+        wait_job(jid)
+        is_scf_converged = check_electronic_convergence()
+        is_finished = check_job_success()
+        
+        if is_finished and is_scf_converged: m_status = "Success"
+        elif is_finished and not is_scf_converged: m_status = "Failed (Electronic Steps NOT Converged)"
+        else: m_status = "Failed/Incomplete"
+        
+        c_log(f"作业监控完成。结果: {m_status}", "INFO")
+        send_email(m_status, start_t)
+    else:
+        c_log("Failed to submit job. Please check 'qsub wk.pbs'.", "ERROR")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# ==============================================================================
+# 5. 后台提交作业
+# ==============================================================================
+echo ""
+echo "========================================= "
+echo ">>> [步骤 5] 正在通过后台拉起任务..."
+echo "========================================= "
+
+nohup python3 -u vasp_infinite_wait.py > stdout.log 2>&1 &
+
+PID=$!
+echo ">>> 🎉 工作流启动成功！后台进程 PID: $PID"
+echo ">>> 执行 tail -f auto_opt.log 追踪状态。"
+
+

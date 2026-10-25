@@ -1,0 +1,42 @@
+#!/bin/bash
+OUTPUT_FILE="band.conf"
+echo "----------------------------------------"
+echo "  正在生成 Phonopy band.conf 配置文件"
+echo "----------------------------------------"
+
+# 1. 获取扩胞尺寸 (DIM)
+# ----------------------------------------
+read -p "请输入扩胞尺寸 (例如 2 2 2 或 3 3 2): " USER_DIM
+if [ -z "$USER_DIM" ]; then
+    echo "未输入，默认使用: 1 1 1"
+    DIM_VAL="1 1 1"
+else
+    DIM_VAL="$USER_DIM"
+fi
+
+# 4. 生成文件
+# ----------------------------------------
+# 关键修复1：EOF顶格，且Here Document用单引号避免$被解析
+cat > "$OUTPUT_FILE" << 'EOF'
+EIGENVECTORS = .TRUE.
+DIM = $DIM_VAL
+FORCE_CONSTRAINS = READ
+BAND = 0.0 0.0 0.0 0.5 0.0 0.0 0.33 0.33 0.0 0.0 0.0 0.0        
+BAND_LABELS = \Gamma M K \Gamma
+BAND_POINTS = 101
+BAND_CONNECTION = .FALSE.
+FC_SYMMETRY = 181  
+GROUP_VELOCITY = .TRUE.
+EOF
+
+# 关键修复2：替换Here Document中的变量（因为用了单引号，变量不会自动替换，需手动替换）
+sed -i "s/\$DIM_VAL/$DIM_VAL/g" "$OUTPUT_FILE"
+sed -i "s/\$POINTS_VAL/$POINTS_VAL/g" "$OUTPUT_FILE"
+sed -i "s/\$FC_TAG/$FC_TAG/g" "$OUTPUT_FILE"
+# 修复Γ符号的$转义
+sed -i "s/\$Γ\$/\\\$Γ\\\$/g" "$OUTPUT_FILE"
+
+echo "----------------------------------------"
+echo "成功生成: $OUTPUT_FILE"
+echo "注意: 请打开文件并手动修改 'BAND' 和 'BAND_LABELS' 为你体系的实际路径。"
+echo "----------------------------------------"

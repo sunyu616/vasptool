@@ -1,0 +1,34 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 私密信息（含邮箱/授权码，严禁上传）
+私密信息_勿上传.md
+
+# 不上传的脚本
+INCAR生成/
+
+# 旧版说明书及其生成工具（内容提及 incar.py，且已被 docs/使用说明.md 取代）
+docs/使用说明.txt
+docs/VASP_ASE脚本使用说明书.docx
+docs/VASP_ASE脚本使用说明书.pdf
+docs/generate_pdf.py
+docs/generate_docx.py
+
+# 本地工具配置
+.claude/
+
+# 冗余压缩包（仓库内容的自打包副本）
+*.rar
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 计算运行产物（防止误提交日志）
+nohup.out
+stdout.log
+workflow.log
+auto_opt.log
+opt_progress.png

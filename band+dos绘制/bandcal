@@ -1,0 +1,169 @@
+#!/bin/bash
+
+# ==================================================================
+# Vaspkit BAND.dat 自动绘图脚本 (无刻度短线版)
+# 功能：
+# 1. 颜色: NM(蓝), FM(上蓝/下绿)
+# 2. 坐标轴:
+#    - Y轴范围: -10 到 +10 eV
+#    - Y轴刻度: 增量 10 (-10, 0, 10)
+#    - 样式: 左右无空隙，无刻度短线
+# ==================================================================
+
+set -e
+
+# --- 1. 检查文件 ---
+if [ ! -f BAND.dat ]; then
+    echo "Error: BAND.dat not found."
+    exit 1
+fi
+if [ ! -f KLABELS ]; then
+    echo "Error: KLABELS not found."
+    exit 1
+fi
+
+# --- 2. 判别磁性 ---
+IS_FM="false"
+if [ -f OUTCAR ]; then
+    ispin=$(grep "ISPIN" OUTCAR | tail -1 | awk -F'=' '{print $2}' | awk '{print $1}')
+    if [ "$ispin" == "2" ]; then
+        IS_FM="true"
+        echo "Mode: Spin-Polarized (FM)"
+    else
+        echo "Mode: Non-Magnetic (NM)"
+    fi
+else
+    echo "Warning: OUTCAR not found. Defaulting to NM."
+fi
+
+# --- 3. 生成 Python 脚本 ---
+PYTHON_SCRIPT="plot_band_custom.py"
+OUTPUT_IMG="band_structure.png"
+
+cat << EOF > "$PYTHON_SCRIPT"
+import matplotlib.pyplot as plt
+import numpy as np
+import sys
+
+# === 样式设置 ===
+plt.rcParams['text.usetex'] = False
+plt.rcParams['mathtext.fontset'] = 'cm'
+plt.rcParams['font.family'] = 'STIXGeneral'
+plt.rcParams['font.size'] = 14
+plt.rcParams['axes.linewidth'] = 1.2
+
+# === 参数 ===
+band_file = "BAND.dat"
+klabels_file = "KLABELS"
+is_fm = "$IS_FM" == "true"
+output_file = "$OUTPUT_IMG"
+
+ymin = -10
+ymax = 10
+ystep = 10
+
+# === 读取数据 ===
+try:
+    data = np.loadtxt(band_file)
+    k_path = data[:, 0]
+    energies = data[:, 1:]
+except Exception as e:
+    print(f"Error reading BAND.dat: {e}")
+    sys.exit(1)
+
+# === 读取 KLABELS ===
+ticks = []
+labels = []
+try:
+    with open(klabels_file, 'r') as f:
+        for line in f:
+            if line.strip().startswith('#') or not line.strip(): continue
+            parts = line.strip().split()
+            if len(parts) < 2: continue
+            
+            try:
+                val = float(parts[0])
+                coord = val
+                label_raw = parts[1]
+            except ValueError:
+                try:
+                    coord = float(parts[1])
+                    label_raw = parts[0]
+                except ValueError:
+                    continue
+
+            if label_raw.upper() in ['G', 'GAMMA']:
+                label = r'$\Gamma$'
+            else:
+                label = label_raw.replace("'", "").replace('"', "")
+
+            ticks.append(coord)
+            labels.append(label)
+
+    # 去重
+    seen = set()
+    ticks_unique = []
+    labels_unique = []
+    for t, l in zip(ticks, labels):
+        if t not in seen:
+            ticks_unique.append(t)
+            labels_unique.append(l)
+            seen.add(t)
+    ticks = ticks_unique
+    labels = labels_unique
+
+except Exception as e:
+    print(f"Error parsing KLABELS: {e}")
+    sys.exit(1)
+
+# === 绘图 ===
+fig, ax = plt.subplots(figsize=(6, 5))
+
+# 1. 绘制参考线
+for t in ticks:
+    ax.axvline(x=t, color='black', linestyle='--', linewidth=1.0, alpha=0.7, zorder=1)
+ax.axhline(y=0, color='black', linestyle='--', linewidth=1.0, alpha=0.7, zorder=1)
+
+# 2. 绘制能带
+num_energy_cols = energies.shape[1]
+lw = 1.5
+color_nm = 'blue'        # NM 蓝色
+color_up = 'blue'        # FM 上 蓝色
+color_down = 'green'     # FM 下 绿色
+
+if is_fm:
+    num_bands = num_energy_cols // 2
+    for i in range(num_bands):
+        ax.plot(k_path, energies[:, 2*i], color=color_up, linewidth=lw, zorder=2)
+        ax.plot(k_path, energies[:, 2*i+1], color=color_down, linewidth=lw, zorder=2)
+else:
+    for i in range(num_energy_cols):
+        ax.plot(k_path, energies[:, i], color=color_nm, linewidth=lw, zorder=2)
+
+# === 坐标轴设置 (核心修改区) ===
+
+# X 轴: 无空隙，无短线
+ax.set_xlim(k_path.min(), k_path.max())
+ax.set_xticks(ticks)
+ax.set_xticklabels(labels, fontsize=16)
+ax.set_xlabel("")
+ax.tick_params(axis='x', length=0) # 隐藏 X 轴刻度短线
+
+# Y 轴: 无空隙，无短线，刻度 -10, 0, 10
+ax.set_ylim(ymin, ymax)
+ax.set_ylabel("Energy (eV)", fontsize=16)
+ax.set_yticks(np.arange(ymin, ymax + 0.1, ystep))
+ax.tick_params(axis='y', labelsize=14, length=0) # 隐藏 Y 轴刻度短线
+
+# 去除 margins
+ax.margins(x=0, y=0)
+
+plt.tight_layout()
+plt.savefig(output_file, dpi=300, bbox_inches='tight')
+print(f"Saved: {output_file}")
+EOF
+
+# --- 运行 ---
+python3 "$PYTHON_SCRIPT"
+rm "$PYTHON_SCRIPT"
+

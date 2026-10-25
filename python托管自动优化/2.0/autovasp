@@ -1,0 +1,445 @@
+#!/bin/bash
+set -euo pipefail
+
+# 定义生成的 Python 文件名
+FILENAME="vasp_infinite_wait.py"
+
+# 检查依赖（确保Python环境可用）
+if ! command -v python3 &> /dev/null; then
+    echo "⚠️  警告：未找到python3，请先安装Python3环境！"
+    exit 1
+fi
+
+echo "正在当前目录下生成 $FILENAME ..."
+
+# 使用 'EOF' (带单引号) 防止 Shell 解析 Python 代码中的 $ 符号
+cat << 'EOF' > "${FILENAME}"
+import os
+import time
+import subprocess
+import shutil
+import numpy as np
+import logging
+import sys
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
+
+# ================== 1. 核心控制区域 (用户修改) ==================
+
+# --- 🟢 脚本运行模式 ---
+SCRIPT_MODE = 'OPT'  # 'OPT' (自动优化) 或 'MONITOR' (仅监视)
+
+# --- 同步模式 (仅用于 OPT) ---
+SYNC_MODE = 'None'   # 'None': 独立优化, 'AB': a=b, 'ABC': a=b=c
+
+# --- 优化开关 ---
+OPT_A = True
+OPT_B = True
+OPT_C = False
+
+# --- 📧 邮件配置 ---
+ENABLE_EMAIL = True
+SMTP_SERVER = "smtp.qq.com"
+SMTP_PORT = 465
+SENDER_EMAIL = "your_qq_number@qq.com"
+SENDER_PASSWORD = "在此填入QQ邮箱授权码"  # 替换为你的邮箱授权码
+RECEIVER_EMAIL = "your_qq_number@qq.com"
+
+# --- 🏗️ 任务管理 ---
+SUBMIT_CMD = "qsub wk.pbs"      # 替换为你的任务提交命令
+CHECK_CMD = "qstat"             # 替换为你的任务查询命令
+JOB_ID_REGEX = r"(\d+)\.master" # 替换为匹配任务ID的正则
+MAX_RETRIES = 3                 # 单个迭代步最大重试次数 (超时/错误续算)
+
+# --- ⏳ 等待策略 ---
+MIN_CHECK_INTERVAL = 30     # 初始等待 (秒)
+MAX_CHECK_INTERVAL = 300    # 最大等待 (秒) - 建议设大一点，减少IO
+CHECK_INTERVAL_GROWTH = 1.2 # 增长倍率
+
+# --- ⚛️ 物理参数与收敛标准 ---
+CHECK_XX = True
+CHECK_YY = True
+CHECK_ZZ = False
+TOLERANCE_KB = 1.0     # 收敛标准 (kB)
+MAX_ITER = 20          # 最大优化步数
+MAX_STRAIN = 0.03      # 单次最大形变量 (防止结构崩坏)
+
+# --- 🧠 智能优化参数 ---
+INITIAL_ALPHA = 0.0005 # 初始猜测的柔度 (1/BulkModulus), 0.0005 约等于 Bulk=200GPa
+MIN_ALPHA = 0.0001     # 最小步长因子
+MAX_ALPHA = 0.0020     # 最大步长因子
+
+# ================== 2. 日志初始化 ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler("auto_opt.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# ================== 3. 全局变量 ==================
+optimization_history = []
+
+# ================== 4. 辅助函数 ==================
+
+def send_email(status, duration_sec, stress=None, iter_count=0, extra_msg=""):
+    if not ENABLE_EMAIL: return
+    logging.info(">> Preparing email report...")
+    current_dir = os.getcwd()
+    m, s = divmod(duration_sec, 60)
+    h, m = divmod(m, 60)
+    time_str = f"{int(h)}h {int(m)}m {int(s)}s"
+
+    stress_str = "N/A"
+    if stress is not None:
+        stress_str = f"XX={stress[0]:.2f}, YY={stress[1]:.2f}, ZZ={stress[2]:.2f}"
+
+    subject = f"[VASP] {status} - Iter {iter_count}"
+    content = (f"Status: {status}\n"
+               f"Dir: {current_dir}\n"
+               f"Time: {time_str}\n"
+               f"Iter: {iter_count}/{MAX_ITER}\n"
+               f"Stress (kB): {stress_str}\n"
+               f"Message: {extra_msg}")
+
+    try:
+        msg = MIMEText(content, 'plain', 'utf-8')
+        msg['Subject'] = Header(subject, 'utf-8')
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], msg.as_string())
+        server.quit()
+        logging.info(">> Email sent successfully.")
+    except Exception as e:
+        logging.error(f"!! Email failed: {e}")
+
+def run_cmd(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8', errors='ignore').strip()
+    except Exception:
+        return ""
+
+def submit_job():
+    logging.info(f">> Submitting: {SUBMIT_CMD}")
+    out = run_cmd(SUBMIT_CMD)
+    # 尝试匹配 PBS/Slurm ID
+    match = re.search(JOB_ID_REGEX, out)
+    if match: return match.group(1)
+    
+    # 备用匹配：寻找第一个纯数字串
+    alt = re.search(r"(\d+)", out)
+    if alt: return alt.group(1)
+    
+    logging.error(f"!! Failed to parse Job ID from output: {out}")
+    return None
+
+def is_job_running(job_id_number):
+    output = run_cmd(CHECK_CMD)
+    # 简单判断 ID 是否在 qstat 列表中
+    if job_id_number not in output: return False
+    
+    # 详细状态检查 (针对 PBS/Torque)
+    for line in output.splitlines():
+        if job_id_number in line:
+            # 状态 C (Completed) 或 E (Exiting) 视为结束
+            if re.search(r"\s[CE]\s|\s[CE]$", line):
+                logging.info(f">> Job [{job_id_number}] status is 'Completed/Exiting'.")
+                return False
+            return True
+    return False
+
+def wait_job(job_id):
+    """
+    自适应等待：减少对队列系统的查询频率
+    """
+    logging.info(f">> Monitoring Job [{job_id}]...")
+    time.sleep(MIN_CHECK_INTERVAL) 
+    
+    current_interval = MIN_CHECK_INTERVAL
+    
+    while is_job_running(job_id):
+        time.sleep(current_interval)
+        # 增加等待间隔，减少IO压力
+        next_interval = current_interval * CHECK_INTERVAL_GROWTH
+        current_interval = min(next_interval, MAX_CHECK_INTERVAL)
+
+    logging.info(f">> Job [{job_id}] disappeared from queue.")
+    time.sleep(5) # 额外缓冲，确保文件系统同步
+
+def check_job_success():
+    """
+    检查 OUTCAR 是否包含成功结束的标志。
+    这是判断任务是否算完（还是超时/崩溃）的黄金标准。
+    """
+    if not os.path.exists("OUTCAR"):
+        logging.warning("!! OUTCAR not found.")
+        return False
+    
+    try:
+        # 读取文件最后 50KB 寻找结束语
+        file_size = os.path.getsize("OUTCAR")
+        with open("OUTCAR", 'rb') as f:
+            seek_pos = max(0, file_size - 51200)
+            f.seek(seek_pos)
+            content = f.read().decode('utf-8', errors='ignore')
+            
+            if "General timing and accounting informations for this job" in content:
+                return True
+            else:
+                logging.warning("!! 'General timing' tag NOT found in OUTCAR.")
+                return False
+    except Exception as e:
+        logging.error(f"!! Error reading OUTCAR: {e}")
+        return False
+
+def handle_retry(retry_count):
+    """
+    处理任务失败后的续算逻辑。
+    """
+    logging.info(f">> Handling failure (Attempt {retry_count}/{MAX_RETRIES})...")
+    
+    # 检查是否有 CONTCAR 且不为空
+    if os.path.exists("CONTCAR") and os.path.getsize("CONTCAR") > 0:
+        logging.info(">> Found valid CONTCAR. Copying to POSCAR for restart.")
+        shutil.copy2("CONTCAR", "POSCAR")
+        return True
+    else:
+        logging.warning("!! CONTCAR missing or empty. Retrying with existing POSCAR.")
+        return True # 仍然返回 True 允许重试，可能只是节点抽风
+
+def read_stress():
+    """
+    读取应力张量 (kB)。
+    """
+    if not os.path.exists("OUTCAR"): return None
+    try:
+        # 只读取最后一次出现的 stress
+        with open("OUTCAR", 'rb') as f:
+            f.seek(0, 2)
+            # 往前读直到找到 'in kB'
+            block_size = 102400
+            pos = max(0, f.tell() - block_size)
+            f.seek(pos)
+            lines = f.read().decode('utf-8', errors='ignore').splitlines()
+            
+            for line in reversed(lines):
+                if "in kB" in line and "external pressure" not in line:
+                    # 格式:  xx  yy  zz  xy  yz  zx
+                    parts = line.split()
+                    return np.array([float(parts[2]), float(parts[3]), float(parts[4])])
+    except Exception as e:
+        logging.error(f"!! Error reading stress: {e}")
+    return None
+
+def calculate_smart_strain(axis_idx, current_len, current_stress):
+    """
+    改进的步长计算算法。
+    """
+    axis_name = ['A', 'B', 'C'][axis_idx]
+    
+    # 1. 如果没有历史记录，使用默认 ALPHA (线性近似)
+    if len(optimization_history) < 1:
+        strain = -current_stress * INITIAL_ALPHA
+        logging.info(f"   [{axis_name}] Mode: Init Linear (Alpha={INITIAL_ALPHA}) -> Strain: {strain:.6f}")
+        return strain
+
+    # 2. 获取上一步的信息
+    prev = optimization_history[-1]
+    prev_stress = prev['stress'][axis_idx]
+    prev_len = prev['lengths'][axis_idx]
+    
+    delta_stress = current_stress - prev_stress
+    delta_len = current_len - prev_len
+    
+    # 计算实际产生的应变
+    actual_strain_step = delta_len / prev_len if prev_len != 0 else 0
+
+    # 3. 计算刚度与新步长
+    # 只有当应力变化显著且应变不为0时，才计算割线模量
+    if abs(delta_stress) > 0.5 and abs(actual_strain_step) > 1e-5:
+        # 估计的柔度 alpha = d(Strain) / d(Stress)
+        estimated_alpha = -(actual_strain_step / delta_stress)
+        
+        # 3.1 符号检查：alpha 必须为正 (受压应缩小)
+        if estimated_alpha < 0:
+            logging.warning(f"   [{axis_name}] Abnormal stiffness detected (Alpha<0). Reverting to default.")
+            target_alpha = INITIAL_ALPHA
+        else:
+            # 3.2 限制 Alpha 范围，防止步长过大或过小
+            target_alpha = max(MIN_ALPHA, min(estimated_alpha, MAX_ALPHA))
+            
+            # 3.3 震荡检测：如果应力符号翻转 (例如 +10 -> -5)，说明过冲，引入阻尼
+            if current_stress * prev_stress < 0:
+                logging.info(f"   [{axis_name}] Oscillation detected. Damping applied.")
+                target_alpha *= 0.6 # 阻尼系数
+            
+            logging.info(f"   [{axis_name}] Mode: Smart (Est. Alpha={target_alpha:.5f})")
+    else:
+        # 变化太小，沿用默认或保守策略
+        target_alpha = INITIAL_ALPHA
+        logging.info(f"   [{axis_name}] Mode: Fallback Linear (Small delta)")
+
+    # 4. 计算最终应变
+    final_strain = -current_stress * target_alpha
+    
+    # 5. 硬截断：防止单次变形过大
+    if abs(final_strain) > MAX_STRAIN:
+        logging.warning(f"   [{axis_name}] Strain {final_strain:.4f} exceeds limit. Clamped to {MAX_STRAIN}.")
+        final_strain = np.sign(final_strain) * MAX_STRAIN
+        
+    return final_strain
+
+def update_poscar_improved(current_stress):
+    if os.path.exists("CONTCAR") and os.path.getsize("CONTCAR") > 100:
+        shutil.copy2("CONTCAR", "POSCAR")
+    if not os.path.exists("POSCAR"): return False
+    
+    try:
+        with open("POSCAR", 'r') as f: lines = f.readlines()
+        # 读取晶格矢量 (第3-5行)
+        vecs = [np.array([float(x) for x in lines[i].split()]) for i in range(2, 5)]
+        lens = np.array([np.linalg.norm(v) for v in vecs])
+    except: return False
+
+    # 处理同步约束 (AB 或 ABC)
+    eff_stress = np.copy(current_stress)
+    if SYNC_MODE == 'AB':
+        avg = (current_stress[0] + current_stress[1]) / 2.0
+        eff_stress[0] = eff_stress[1] = avg
+    elif SYNC_MODE == 'ABC':
+        avg = np.mean(current_stress[:3])
+        eff_stress[:3] = avg
+
+    # 计算缩放因子
+    scaling_factors = []
+    flags = [OPT_A, OPT_B, OPT_C]
+    
+    logging.info("⚖️  Calculating Optimization Steps:")
+    for i in range(3):
+        if flags[i]:
+            strain = calculate_smart_strain(i, lens[i], eff_stress[i])
+            factor = 1.0 + strain
+        else:
+            factor = 1.0
+        scaling_factors.append(factor)
+
+    # 记录历史
+    optimization_history.append({'lengths': lens, 'stress': eff_stress})
+
+    # 更新晶格矢量
+    logging.info(f"📐 New Scaling Factors: {[f'{s:.6f}' for s in scaling_factors]}")
+    for i in range(3):
+        nv = vecs[i] * scaling_factors[i]
+        lines[2+i] = f" {nv[0]:18.12f} {nv[1]:18.12f} {nv[2]:18.12f}\n"
+
+    # 备份与写入
+    shutil.copy2("POSCAR", "POSCAR_backup_prev")
+    with open("POSCAR", 'w') as f: f.writelines(lines)
+    return True
+
+# ================== 6. 主程序 ==================
+
+def main():
+    logging.info(f"=== VASP SMART OPTIMIZER | MODE: {SCRIPT_MODE} ===")
+    logging.info(f"Target Pressure < {TOLERANCE_KB} kB")
+    start_time = time.time()
+    
+    if SCRIPT_MODE == 'MONITOR':
+        # 监控模式逻辑不变...
+        job_id = submit_job()
+        if job_id:
+            wait_job(job_id)
+            if check_job_success():
+                send_email("Monitor: Success", time.time() - start_time)
+            else:
+                send_email("Monitor: Failed/Incomplete", time.time() - start_time)
+        else:
+            logging.error("Submit failed")
+
+    elif SCRIPT_MODE == 'OPT':
+        final_status = "Failed"
+        stress = None
+        
+        for i in range(1, MAX_ITER + 1):
+            logging.info(f"\n======== Iteration {i} / {MAX_ITER} ========")
+            
+            # --- Retry Loop ---
+            retry_success = False
+            for retry in range(MAX_RETRIES):
+                job_id = submit_job()
+                if not job_id:
+                    logging.error("Submit command failed. Retrying...")
+                    time.sleep(10)
+                    continue
+                
+                wait_job(job_id)
+                
+                # 检查任务是否真的算完了
+                if check_job_success():
+                    retry_success = True
+                    break
+                else:
+                    logging.warning(f"!! Job finished but seems INCOMPLETE (Try {retry+1}/{MAX_RETRIES})")
+                    # 尝试处理续算
+                    handle_retry(retry+1)
+                    # 循环继续，重新提交
+            
+            if not retry_success:
+                logging.error("!! Max retries reached. Optimization aborting.")
+                final_status = "Aborted (Max Retries)"
+                break
+            
+            # --- Convergence Check ---
+            stress = read_stress()
+            if stress is None:
+                logging.error("!! Cannot read stress from OUTCAR.")
+                break
+                
+            logging.info(f"📊 Current Stress (kB): {stress}")
+            
+            converged = True
+            if CHECK_XX and abs(stress[0]) > TOLERANCE_KB: converged = False
+            if CHECK_YY and abs(stress[1]) > TOLERANCE_KB: converged = False
+            if CHECK_ZZ and abs(stress[2]) > TOLERANCE_KB: converged = False
+            
+            # 备份文件
+            shutil.copy2("OUTCAR", f"OUTCAR_iter_{i}")
+            if os.path.exists("vasprun.xml"): shutil.copy2("vasprun.xml", f"vasprun.xml_iter_{i}")
+            
+            if converged:
+                final_status = "Converged"
+                logging.info("🎉 CONVERGENCE ACHIEVED!")
+                break
+            
+            # --- Geometry Update ---
+            if i < MAX_ITER:
+                if not update_poscar_improved(stress):
+                    logging.error("!! Failed to update POSCAR.")
+                    break
+            else:
+                final_status = "Max Iter Reached"
+                logging.warning("!! Reached maximum iterations without convergence.")
+
+        send_email(final_status, time.time() - start_time, stress, i)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# 验证文件生成
+if [ -f "${FILENAME}" ]; then
+    echo "✅ 成功生成 ${FILENAME}"
+    echo "📝 脚本路径: $(pwd)/${FILENAME}"
+    echo "💡 运行建议: nohup python3 -u ${FILENAME} > auto_opt.log 2>&1 &"
+    echo "📌 重要提示: 请先修改 ${FILENAME} 中的集群配置/邮件配置/物理参数后再运行！"
+else
+    echo "❌ 生成 ${FILENAME} 失败！"
+    exit 1
+fi

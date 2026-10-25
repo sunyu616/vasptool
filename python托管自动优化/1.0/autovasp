@@ -1,0 +1,296 @@
+#!/bin/bash
+set -euo pipefail
+
+# 定义生成的 Python 文件名
+FILENAME="vasp_infinite_wait.py"
+
+echo "正在当前目录下生成 $FILENAME ..."
+
+# 写入 Python 代码
+cat << EOF > "${FILENAME}"
+import os
+import time
+import subprocess
+import shutil
+import numpy as np
+import logging
+import sys
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
+
+# ================== 1. 核心控制区域 (用户修改) ==================
+
+# --- 🟢 脚本运行模式 ---
+SCRIPT_MODE = 'OPT'  # 'OPT' (自动优化) 或 'MONITOR' (仅监视)
+
+# --- 同步模式 (仅用于 OPT) ---
+SYNC_MODE = 'None'   # 'None', 'AB', 'ABC'
+
+# --- 优化开关 ---
+OPT_A = True
+OPT_B = True
+OPT_C = False
+
+# --- 📧 邮件配置 ---
+ENABLE_EMAIL = True
+SMTP_SERVER = "smtp.qq.com"
+SMTP_PORT = 465
+SENDER_EMAIL = "your_qq_number@qq.com"
+SENDER_PASSWORD = "在此填入QQ邮箱授权码"
+RECEIVER_EMAIL = "your_qq_number@qq.com"
+
+# --- 🏗️ 任务管理 ---
+SUBMIT_CMD = "qsub wk.pbs"
+CHECK_CMD = "qstat"
+JOB_ID_REGEX = r"(\d+)\.master"
+
+# --- ⏳ 智能监控策略 (自适应等待) ---
+# 逻辑：初始等待 MIN 秒，每次等待时间 x GROWTH，直到达到 MAX 秒后固定
+MIN_CHECK_INTERVAL = 10     # 初始检查间隔 (秒)
+MAX_CHECK_INTERVAL = 60     # 最大检查间隔 (秒) -> 固定为1分钟
+CHECK_INTERVAL_GROWTH = 1.5 # 增长倍率
+
+# --- ⚛️ 物理参数 ---
+CHECK_XX = True
+CHECK_YY = True
+CHECK_ZZ = False
+TOLERANCE_KB = 1.0
+ALPHA = 0.0005
+MAX_STRAIN = 0.05
+MAX_ITER = 20
+ENABLE_SMART_OPT = True
+SMART_DAMPING = 0.8
+
+# ================== 2. 日志初始化 ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler("auto_opt.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# ================== 3. 全局变量 ==================
+optimization_history = []
+
+# ================== 4. 辅助函数 ==================
+
+def send_email(status, duration_sec, stress=None, iter_count=0):
+    if not ENABLE_EMAIL: return
+    logging.info(">> Preparing email report...")
+    current_dir = os.getcwd()
+    m, s = divmod(duration_sec, 60)
+    h, m = divmod(m, 60)
+    time_str = f"{int(h)}h {int(m)}m {int(s)}s"
+
+    if SCRIPT_MODE == 'OPT':
+        stress_str = f"XX={stress[0]:.2f}, YY={stress[1]:.2f}, ZZ={stress[2]:.2f}" if stress is not None else "N/A"
+        subject = f"[VASP-OPT] {status} - {time_str}"
+        content = f"Status: {status}\nDir: {current_dir}\nTime: {time_str}\nIter: {iter_count}/{MAX_ITER}\nStress: {stress_str}"
+    else:
+        subject = f"[VASP-MONITOR] Finished - {time_str}"
+        content = f"Status: {status}\nDir: {current_dir}\nTime: {time_str}"
+
+    try:
+        msg = MIMEText(content, 'plain', 'utf-8')
+        msg['Subject'] = Header(subject, 'utf-8')
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], msg.as_string())
+        server.quit()
+        logging.info(">> Email sent successfully.")
+    except Exception as e:
+        logging.error(f"!! Email failed: {e}")
+
+def run_cmd(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8', errors='ignore').strip()
+    except Exception:
+        return ""
+
+def submit_job():
+    logging.info(f">> Submitting: {SUBMIT_CMD}")
+    out = run_cmd(SUBMIT_CMD)
+    match = re.search(JOB_ID_REGEX, out)
+    if match: return match.group(1)
+    alt = re.search(r"(\d+)", out)
+    return alt.group(1) if alt else None
+
+def is_job_running(job_id_number):
+    output = run_cmd(CHECK_CMD)
+    if job_id_number not in output: return False
+    for line in output.splitlines():
+        if job_id_number in line:
+            if re.search(r"\sC\s|\sC$", line): # 状态 C 表示完成
+                logging.info(f">> Job [{job_id_number}] marked as 'C'.")
+                return False
+            return True
+    return False
+
+def wait_job(job_id):
+    """
+    自适应等待：10s起步，逐渐增加，上限60s。
+    """
+    logging.info(f">> Monitoring Job [{job_id}]...")
+    time.sleep(MIN_CHECK_INTERVAL) 
+    
+    current_interval = MIN_CHECK_INTERVAL
+    
+    while is_job_running(job_id):
+        time.sleep(current_interval)
+        
+        # 计算下一次间隔
+        next_interval = current_interval * CHECK_INTERVAL_GROWTH
+        # 如果计算结果超过MAX，取MAX (60s)
+        current_interval = min(next_interval, MAX_CHECK_INTERVAL)
+
+    logging.info(f">> Job [{job_id}] finished.")
+    time.sleep(10)
+
+def read_stress():
+    if not os.path.exists("OUTCAR"): return None
+    try:
+        with open("OUTCAR", 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 102400))
+            lines = f.read().decode('utf-8', errors='ignore').splitlines()
+            for line in reversed(lines):
+                if "in kB" in line and "external pressure" not in line:
+                    p = line.split()
+                    return np.array([float(p[2]), float(p[3]), float(p[4])])
+    except: pass
+    return None
+
+def calculate_smart_factor(axis_idx, current_len, current_stress):
+    axis_name = ['A', 'B', 'C'][axis_idx]
+    default_strain = current_stress * ALPHA
+    
+    if not ENABLE_SMART_OPT or len(optimization_history) < 1:
+        logging.info(f"   [{axis_name}] Mode: Linear")
+        final_strain = default_strain
+    else:
+        prev = optimization_history[-1]
+        delta_s = current_stress - prev['stress'][axis_idx]
+        delta_l = current_len - prev['lengths'][axis_idx]
+        
+        if abs(delta_l) < 1e-6 or abs(delta_s) < 0.1:
+            final_strain = default_strain
+        else:
+            stiff = delta_s / delta_l
+            target = current_len - (current_stress / stiff)
+            smart_strain = ((target - current_len) / current_len) * SMART_DAMPING
+            if abs(smart_strain) > MAX_STRAIN * 1.5:
+                final_strain = default_strain
+            else:
+                logging.info(f"   [{axis_name}] Mode: SMART (Stiff={stiff:.2f})")
+                final_strain = smart_strain
+
+    return 1.0 + max(min(final_strain, MAX_STRAIN), -MAX_STRAIN)
+
+def update_poscar_smart(current_stress):
+    if os.path.exists("CONTCAR") and os.path.getsize("CONTCAR") > 100:
+        shutil.copy2("CONTCAR", "POSCAR")
+    if not os.path.exists("POSCAR"): return False
+    
+    try:
+        with open("POSCAR", 'r') as f: lines = f.readlines()
+        vecs = [np.array([float(x) for x in lines[i].split()]) for i in range(2, 5)]
+        lens = np.array([np.linalg.norm(v) for v in vecs])
+    except: return False
+
+    eff_stress = np.copy(current_stress)
+    if SYNC_MODE == 'AB':
+        eff_stress[0] = eff_stress[1] = (current_stress[0] + current_stress[1]) / 2.0
+    elif SYNC_MODE == 'ABC':
+        eff_stress[:3] = np.mean(current_stress[:3])
+
+    scales = []
+    flags = [OPT_A, OPT_B, OPT_C]
+    for i in range(3):
+        scales.append(calculate_smart_factor(i, lens[i], eff_stress[i]) if flags[i] else 1.0)
+
+    optimization_history.append({'lengths': lens, 'stress': eff_stress})
+    logging.info(f"📐 Scales: {[f'{s:.6f}' for s in scales]}")
+
+    for i in range(3):
+        nv = vecs[i] * scales[i]
+        lines[2+i] = f" {nv[0]:18.12f} {nv[1]:18.12f} {nv[2]:18.12f}\n"
+
+    shutil.copy2("POSCAR", "POSCAR_backup_prev")
+    with open("POSCAR", 'w') as f: f.writelines(lines)
+    return True
+
+# ================== 6. 主程序 ==================
+
+def main():
+    logging.info(f"=== VASP AUTO-OPT | MODE: {SCRIPT_MODE} ===")
+    start_time = time.time()
+    
+    if SCRIPT_MODE == 'MONITOR':
+        job_id = submit_job()
+        if job_id:
+            wait_job(job_id)
+            send_email("Completed", time.time() - start_time)
+        else:
+            logging.error("Submit failed")
+
+    elif SCRIPT_MODE == 'OPT':
+        final_status = "Failed"
+        stress = None
+        iter_count = 0
+        
+        for i in range(1, MAX_ITER + 1):
+            iter_count = i
+            logging.info(f"\n--- Iteration {i}/{MAX_ITER} ---")
+            
+            job_id = submit_job()
+            if not job_id: break
+            
+            wait_job(job_id)
+            
+            stress = read_stress()
+            if stress is None: break
+            logging.info(f"📊 Stress: {stress}")
+            
+            converged = True
+            if CHECK_XX and abs(stress[0]) > TOLERANCE_KB: converged = False
+            if CHECK_YY and abs(stress[1]) > TOLERANCE_KB: converged = False
+            if CHECK_ZZ and abs(stress[2]) > TOLERANCE_KB: converged = False
+            
+            if converged:
+                final_status = "Converged"
+                logging.info("🎉 Converged!")
+                break
+            
+            if i < MAX_ITER:
+                if not update_poscar_smart(stress): break
+            else:
+                final_status = "Max Iter"
+                
+            shutil.copy2("OUTCAR", f"OUTCAR_iter_{i}")
+            if os.path.exists("vasprun.xml"): shutil.copy2("vasprun.xml", f"vasprun.xml_iter_{i}")
+
+        send_email(final_status, time.time() - start_time, stress, iter_count)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# 验证文件生成
+if [ -f "${FILENAME}" ]; then
+    echo "✅ 成功生成 ${FILENAME}"
+    echo "📝 脚本路径: $(pwd)/${FILENAME}"
+    echo "💡 运行方式: nohup python3 -u vasp_infinite_wait.py > auto_opt.log 2>&1 &"
+else
+    echo "❌ 生成 ${FILENAME} 失败！"
+    exit 1
+fi
+
+
+

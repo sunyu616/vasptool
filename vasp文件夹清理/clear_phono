@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# ============================================================
+# 脚本名称: clean_phonopy_dirs.sh
+# 功能: 遍历目录，寻找包含 'phonopy' 的文件夹，并删除其下纯数字命名的子文件夹
+# ============================================================
+
+echo "正在扫描目录，请稍候..."
+
+# 创建一个临时文件来存储待删除的列表
+TARGET_LIST_FILE=$(mktemp)
+
+# 1. 第一层查找：寻找所有名字包含 "phonopy" 的文件夹
+find . -type d -name "*phonopy*" -print0 | while IFS= read -r -d '' phonopy_dir; do
+    
+    # 2. 第二层查找：在找到的 phonopy 文件夹下，寻找纯数字命名的子文件夹
+    # -mindepth 1 -maxdepth 1 确保只查找直接子目录，不递归更深层
+    # basename用于提取文件夹名进行正则匹配
+    
+    find "$phonopy_dir" -mindepth 1 -maxdepth 1 -type d -print0 | while IFS= read -r -d '' sub_dir; do
+        dirname=$(basename "$sub_dir")
+        
+        # 使用正则表达式检查文件夹名是否为纯数字 (^[0-9]+$)
+        if [[ "$dirname" =~ ^[0-9]+$ ]]; then
+            echo "$sub_dir" >> "$TARGET_LIST_FILE"
+        fi
+    done
+done
+
+# 检查是否找到了目标
+if [ ! -s "$TARGET_LIST_FILE" ]; then
+    echo "未发现符合条件的文件夹（phonopy文件夹下的纯数字文件夹）。"
+    rm "$TARGET_LIST_FILE"
+    exit 0
+fi
+
+echo "========================================"
+echo "发现以下即将被删除的文件夹："
+echo "========================================"
+cat "$TARGET_LIST_FILE"
+echo "========================================"
+echo "注意：这些文件夹及其内容将被永久删除！"
+
+# 读取用户确认
+read -p "确认要删除以上所有文件夹吗？(y/n): " confirm
+
+if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    # 逐行读取列表并删除
+    while IFS= read -r target; do
+        echo "正在删除: $target"
+        rm -rf "$target"
+    done < "$TARGET_LIST_FILE"
+    echo "清理完成。"
+else
+    echo "操作已取消。"
+fi
+
+# 删除临时文件
+rm "$TARGET_LIST_FILE"
+

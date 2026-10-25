@@ -1,0 +1,448 @@
+#!/bin/bash
+set -euo pipefail
+
+# 定义生成的 Python 文件名
+FILENAME="vasp_infinite_wait.py"
+
+# 检查 Python3
+if ! command -v python3 &> /dev/null; then
+    echo "⚠️  错误：未找到 python3。请加载 Anaconda 或 Python 模块。"
+    exit 1
+fi
+
+# 检查 Matplotlib (用于绘图)
+if ! python3 -c "import matplotlib" &> /dev/null; then
+    echo "⚠️  警告：未检测到 matplotlib 库。绘图功能将自动禁用，但脚本仍可运行。"
+fi
+
+echo "正在生成集成电子步检测、绘图与高精度保护的脚本: $FILENAME ..."
+
+cat << 'EOF' > "${FILENAME}"
+import os
+import time
+import subprocess
+import shutil
+import numpy as np
+import logging
+import sys
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+from email.header import Header
+
+# 尝试导入 matplotlib，用于 headless 环境绘图
+try:
+    import matplotlib
+    matplotlib.use('Agg') # 强制使用非交互式后端，防止在集群上报错
+    import matplotlib.pyplot as plt
+    HAS_PLOT = True
+except ImportError:
+    HAS_PLOT = False
+
+# ================== 1. 用户配置区域 ==================
+
+# --- 🟢 运行模式 ---
+SCRIPT_MODE = 'OPT'  # 'OPT' (优化) 或 'MONITOR' (仅监视)
+
+# --- 同步模式 ---
+SYNC_MODE = 'None'   # 'None': 独立, 'AB': a=b, 'ABC': a=b=c
+
+# --- 优化开关 ---
+OPT_A = True
+OPT_B = True
+OPT_C = False
+
+# --- 📧 邮件配置 ---
+ENABLE_EMAIL = True
+SMTP_SERVER = "smtp.qq.com"
+SMTP_PORT = 465
+SENDER_EMAIL = "your_qq_number@qq.com"
+SENDER_PASSWORD = "在此填入QQ邮箱授权码"
+RECEIVER_EMAIL = "your_qq_number@qq.com"
+
+# --- 🏗️ 任务管理 ---
+SUBMIT_CMD = "qsub wk.pbs"      
+CHECK_CMD = "qstat"             
+JOB_ID_REGEX = r"(\d+)\.master" 
+MAX_RETRIES = 3         # 单个优化步允许的最大重试次数
+
+# --- ⏳ 等待策略 ---
+MIN_CHECK_INTERVAL = 5     
+MAX_CHECK_INTERVAL = 60    
+
+# --- ⚛️ 收敛标准 ---
+TARGET_TOLERANCE = 1.0  # 目标: 应力绝对值 < 1 kB
+MAX_ITER = 20           
+MAX_STRAIN_PER_STEP = 0.04  
+
+# --- 🧠 初始柔度 (Alpha) ---
+INITIAL_ALPHA = 0.0005 
+MIN_ALPHA = 0.0001
+MAX_ALPHA = 0.0050
+
+# ================== 2. 日志与全局变量 ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[logging.FileHandler("opt_enhanced.log"), logging.StreamHandler(sys.stdout)]
+)
+
+# 历史记录: [{'iter': 1, 'stress': [x,y,z], 'strain': [a,b,c]}, ...]
+history_db = []
+current_alphas = np.array([INITIAL_ALPHA, INITIAL_ALPHA, INITIAL_ALPHA])
+
+# ================== 3. 核心检测功能 (含优化1: 电子步检测) ==================
+
+def run_cmd(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode('utf-8', errors='ignore').strip()
+    except: return ""
+
+def get_nelm_from_incar():
+    """从 INCAR 读取 NELM，默认 60"""
+    nelm = 60
+    if os.path.exists("INCAR"):
+        try:
+            with open("INCAR", 'r') as f:
+                for line in f:
+                    if "NELM" in line and "=" in line:
+                        # 处理行如: NELM = 100 ; comment
+                        val = re.search(r"NELM\s*=\s*(\d+)", line)
+                        if val: nelm = int(val.group(1))
+        except: pass
+    return nelm
+
+def check_electronic_convergence():
+    """
+    【优化点 1】检测电子步是否收敛。
+    如果实际步数 == NELM，说明未收敛，结果不可信。
+    """
+    if not os.path.exists("OSZICAR"): return True # 无文件无法检测，默认通过
+    
+    nelm = get_nelm_from_incar()
+    last_steps = 0
+    
+    try:
+        with open("OSZICAR", 'r') as f:
+            lines = f.readlines()
+            # 倒序寻找 "DAV:" 或 "RMM:"
+            for line in reversed(lines):
+                if "DAV:" in line or "RMM:" in line:
+                    # 格式: DAV:  N ...
+                    parts = line.split()
+                    if len(parts) > 1:
+                        last_steps = int(parts[1])
+                    break
+    except: pass
+
+    if last_steps >= nelm:
+        logging.warning(f"!! Electronic Convergence FAILED: Steps ({last_steps}) reached NELM ({nelm}).")
+        return False
+    
+    return True
+
+def check_job_success():
+    """检测 OUTCAR 是否正常结束"""
+    if not os.path.exists("OUTCAR"): return False
+    try:
+        fsize = os.path.getsize("OUTCAR")
+        if fsize == 0: return False
+        with open("OUTCAR", 'rb') as f:
+            f.seek(max(0, fsize - 51200))
+            if "General timing" in f.read().decode('utf-8', errors='ignore'):
+                return True
+    except: pass
+    return False
+
+def submit_job():
+    out = run_cmd(SUBMIT_CMD)
+    match = re.search(JOB_ID_REGEX, out)
+    if match: return match.group(1)
+    alt = re.search(r"(\d+)", out)
+    return alt.group(1) if alt else None
+
+def is_job_running(job_id):
+    out = run_cmd(CHECK_CMD)
+    if job_id not in out: return False
+    for line in out.splitlines():
+        if job_id in line and re.search(r"\s[CE]\s|\s[CE]$", line): return False
+    return True
+
+def wait_job(job_id):
+    logging.info(f">> Monitoring Job [{job_id}]...")
+    time.sleep(MIN_CHECK_INTERVAL)
+    curr = MIN_CHECK_INTERVAL
+    while is_job_running(job_id):
+        time.sleep(curr)
+        curr = min(curr * 1.2, MAX_CHECK_INTERVAL)
+    logging.info(f">> Job [{job_id}] finished.")
+    time.sleep(5)
+
+# ================== 4. 可视化与邮件 (含优化4) ==================
+
+def generate_optimization_plot():
+    """
+    【优化点 4】生成应力变化曲线图
+    """
+    if not HAS_PLOT or not history_db: return None
+    
+    try:
+        iters = [d['iter'] for d in history_db]
+        s_xx = [d['stress'][0] for d in history_db]
+        s_yy = [d['stress'][1] for d in history_db]
+        s_zz = [d['stress'][2] for d in history_db]
+        
+        plt.figure(figsize=(8, 5))
+        plt.plot(iters, s_xx, 'r-o', label='Stress XX')
+        plt.plot(iters, s_yy, 'g-s', label='Stress YY')
+        plt.plot(iters, s_zz, 'b-^', label='Stress ZZ')
+        
+        # 绘制 ±5 kB 目标线
+        plt.axhline(y=TARGET_TOLERANCE, color='k', linestyle='--', alpha=0.3)
+        plt.axhline(y=-TARGET_TOLERANCE, color='k', linestyle='--', alpha=0.3)
+        plt.axhline(y=0, color='k', linestyle='-', alpha=0.5)
+        
+        plt.title('VASP Optimization History')
+        plt.xlabel('Iteration')
+        plt.ylabel('Stress (kB)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        img_name = "opt_progress.png"
+        plt.savefig(img_name)
+        plt.close()
+        return img_name
+    except Exception as e:
+        logging.error(f"Plotting failed: {e}")
+        return None
+
+def send_email(status, start_time, iter_count=0, stress=None):
+    if not ENABLE_EMAIL: return
+    
+    current_dir = os.getcwd()
+    duration = time.time() - start_time
+    m, s = divmod(duration, 60)
+    h, m = divmod(m, 60)
+    
+    msg = MIMEMultipart()
+    subject = f"[VASP] {status}"
+    
+    if SCRIPT_MODE == 'OPT':
+        s_str = f"XX={stress[0]:.2f}, YY={stress[1]:.2f}, ZZ={stress[2]:.2f}" if stress is not None else "N/A"
+        body = (f"Optimization Status: {status}\n"
+                f"Work Dir: {current_dir}\n"
+                f"Duration: {int(h)}h {int(m)}m {int(s)}s\n"
+                f"Iterations: {iter_count}\n"
+                f"Final Stress (kB): {s_str}\n")
+        subject += f" (Iter {iter_count})"
+        
+        # 生成并添加图片附件
+        img_path = generate_optimization_plot()
+        if img_path and os.path.exists(img_path):
+            try:
+                with open(img_path, 'rb') as f:
+                    img_data = f.read()
+                image = MIMEImage(img_data, name=os.path.basename(img_path))
+                msg.attach(image)
+                body += "\n[Attachment] Optimization plot attached.\n"
+            except: pass
+            
+    else:
+        body = (f"Job Status: {status}\n"
+                f"Work Dir: {current_dir}\n"
+                f"Duration: {int(h)}h {int(m)}m\n")
+
+    msg['Subject'] = Header(subject, 'utf-8')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECEIVER_EMAIL
+    msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+    try:
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.sendmail(SENDER_EMAIL, [RECEIVER_EMAIL], msg.as_string())
+        server.quit()
+        logging.info(">> Email sent (with attachment if avail).")
+    except Exception as e:
+        logging.error(f"!! Email failed: {e}")
+
+# ================== 5. 优化逻辑 (含优化5: 对称性保护) ==================
+
+def read_stress_kb():
+    if not os.path.exists("OUTCAR"): return None
+    try:
+        with open("OUTCAR", 'r') as f:
+            for line in reversed(f.readlines()):
+                if "in kB" in line:
+                    parts = line.split()
+                    try:
+                        return np.array([float(parts[2]), float(parts[3]), float(parts[4])])
+                    except: continue
+    except: pass
+    return None
+
+def calculate_next_strain(current_stress):
+    global current_alphas, history_db
+    strains = np.zeros(3)
+    
+    # 严格规则: >0 Expand, <0 Shrink
+    for i in range(3):
+        # 1. 学习 Alpha
+        if len(history_db) >= 1:
+            prev = history_db[-1]
+            d_stress = abs(current_stress[i] - prev['stress'][i])
+            d_strain = abs(prev['strain'][i])
+            if d_stress > 0.5:
+                new_alpha = max(MIN_ALPHA, min(d_strain / d_stress, MAX_ALPHA))
+                current_alphas[i] = 0.7 * new_alpha + 0.3 * current_alphas[i]
+
+        # 2. 计算 Strains
+        mag = abs(current_stress[i]) * current_alphas[i]
+        val = mag if current_stress[i] > 0 else -mag
+        
+        # 3. 震荡阻尼
+        if len(history_db) >= 1 and current_stress[i] * history_db[-1]['stress'][i] < 0:
+            val *= 0.5
+            
+        # 4. 安全阀
+        if abs(val) > MAX_STRAIN_PER_STEP:
+            val = np.sign(val) * MAX_STRAIN_PER_STEP
+            
+        strains[i] = val
+    return strains
+
+def update_poscar(current_stress):
+    if not os.path.exists("CONTCAR") or os.path.getsize("CONTCAR") < 10: return False
+    shutil.copy2("CONTCAR", "POSCAR")
+    
+    try:
+        with open("POSCAR", 'r') as f: lines = f.readlines()
+        vecs = [np.array([float(x) for x in lines[i].split()]) for i in range(2, 5)]
+    except: return False
+
+    # 【优化点 5】对称性保护 - 严格平均
+    eff_stress = np.copy(current_stress)
+    if SYNC_MODE == 'AB':
+        mean_val = np.mean(eff_stress[:2])
+        eff_stress[0] = eff_stress[1] = mean_val
+    elif SYNC_MODE == 'ABC':
+        mean_val = np.mean(eff_stress[:3])
+        eff_stress[:3] = mean_val
+
+    strains = calculate_next_strain(eff_stress)
+    
+    # 【优化点 5】再次确保 Strain 数值完全一致
+    if SYNC_MODE == 'AB':
+        strains[0] = strains[1] = np.mean(strains[:2])
+    elif SYNC_MODE == 'ABC':
+        strains[:] = np.mean(strains)
+
+    history_db.append({'iter': len(history_db)+1, 'stress': np.copy(eff_stress), 'strain': np.copy(strains)})
+
+    flags = [OPT_A, OPT_B, OPT_C]
+    for i in range(3):
+        if flags[i]:
+            vecs[i] = vecs[i] * (1.0 + strains[i])
+        
+        # 【优化点 5】使用 .16f 高精度写入，减少对称性破缺
+        lines[2+i] = f" {vecs[i][0]:22.16f} {vecs[i][1]:22.16f} {vecs[i][2]:22.16f}\n"
+
+    shutil.copy2("POSCAR", "POSCAR_backup_prev")
+    with open("POSCAR", 'w') as f: f.writelines(lines)
+    return True
+
+# ================== 6. 主程序 ==================
+
+def main():
+    start_t = time.time()
+    logging.info(f"=== VASP ENHANCED OPTIMIZER ===")
+    logging.info("Features: Elec Check, Plotting, Sym Guard, Strict Rules")
+    
+    if SCRIPT_MODE == 'MONITOR':
+        # 简单监控逻辑...
+        job_id = submit_job()
+        if job_id:
+            wait_job(job_id)
+            status = "Success" if check_job_success() else "Failed"
+            send_email(status, start_t)
+
+    elif SCRIPT_MODE == 'OPT':
+        final_status = "Failed"
+        stress = None
+        
+        for i in range(1, MAX_ITER + 1):
+            logging.info(f"\n======== Iteration {i} / {MAX_ITER} ========")
+            
+            # --- 任务执行与重试 ---
+            success = False
+            for retry in range(MAX_RETRIES + 1):
+                job_id = submit_job()
+                if not job_id: time.sleep(30); continue
+                wait_job(job_id)
+                
+                # 1. 检查任务是否完成
+                if not check_job_success():
+                    logging.warning(f"!! Job Incomplete (Retry {retry}).")
+                    if retry < MAX_RETRIES and os.path.exists("CONTCAR") and os.path.getsize("CONTCAR")>0:
+                        shutil.copy2("CONTCAR", "POSCAR")
+                        continue
+                    else: break
+
+                # 2. 【优化点 1】检查电子步是否收敛
+                if not check_electronic_convergence():
+                    logging.error("!! Electronic steps NOT converged. Result invalid.")
+                    # 电子步不收敛通常需要人工干预INCAR，这里选择中止防止错误优化
+                    # 如果你想自动重试，可以在这里加逻辑
+                    break 
+                
+                success = True
+                break
+            
+            if not success:
+                final_status = "Aborted (Job/Elec Fail)"
+                break
+            
+            # --- 优化逻辑 ---
+            stress = read_stress_kb()
+            if stress is None: break
+            
+            logging.info(f"📊 Stress: {stress}")
+            
+            converged = True
+            if OPT_A and abs(stress[0]) > TARGET_TOLERANCE: converged = False
+            if OPT_B and abs(stress[1]) > TARGET_TOLERANCE: converged = False
+            if OPT_C and abs(stress[2]) > TARGET_TOLERANCE: converged = False
+            
+            shutil.copy2("OUTCAR", f"OUTCAR_iter_{i}")
+            
+            if converged:
+                final_status = "Converged"
+                logging.info("🎉 Done!")
+                # 记录最后一步以便绘图
+                history_db.append({'iter': i, 'stress': stress, 'strain': np.zeros(3)})
+                break
+            
+            if i < MAX_ITER:
+                if not update_poscar(stress): break
+            else:
+                final_status = "Max Iter Reached"
+
+        send_email(final_status, start_t, i, stress)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+if [ -f "${FILENAME}" ]; then
+    chmod +x "${FILENAME}"
+    echo "✅ 成功生成: ${FILENAME}"
+    echo "📝 脚本路径: $(pwd)/${FILENAME}"
+    echo "💡 运行建议: nohup python3 -u ${FILENAME} > auto_opt.log 2>&1 &"
+    echo "📌 重要提示: 请先修改 ${FILENAME} 中的集群配置/邮件配置/物理参数后再运行！"
+else
+    echo "❌ 生成失败"
+fi
+

@@ -1,0 +1,146 @@
+#!/bin/bash
+
+# ==========================================
+# 极简版 VASP 磁基态诊断脚本
+# ==========================================
+
+MAG_THRESHOLD=0.1
+LOCAL_MAG_THRESH=0.05
+DEGENERATE_TOL=2.0
+
+declare -a valid_dirs
+declare -a energies
+declare -a states
+
+count=0
+
+# 静默处理所有文件夹
+for dir in $(ls -d */ 2>/dev/null); do
+    dir=${dir%/}
+    outcar="${dir}/OUTCAR"
+    
+    if [ ! -f "$outcar" ]; then continue; fi
+
+    nions=$(grep "NIONS" "$outcar" | awk '{print $12}')
+    if [ -z "$nions" ]; then continue; fi
+
+    is_finished=$(tail -n 50 "$outcar" | grep -c "General timing and accounting informations")
+    last_nelm=$(grep "Iteration" "$outcar" | tail -n 1 | awk '{print $4}')
+    nelm_limit=$(grep "NELM" "$outcar" | awk '{print $3}' | head -n 1 | tr -d ';')
+    
+    # 过滤未完成或未收敛的任务
+    if [ "$is_finished" -eq 0 ] || { [[ -n "$last_nelm" && -n "$nelm_limit" ]] && [ "$last_nelm" -ge "${nelm_limit%/*}" ]; }; then
+        continue
+    fi
+
+    energy=$(grep "energy(sigma->0)" "$outcar" | tail -n 1 | awk '{print $7}')
+    [ -z "$energy" ] && energy=$(grep "free  energy   TOTEN" "$outcar" | tail -n 1 | awk '{print $5}')
+    [ -z "$energy" ] && continue
+
+    e_per_atom=$(awk -v e="$energy" -v n="$nions" 'BEGIN{printf "%.6f", e/n}')
+
+    mag_tot=$(grep "number of electron" "$outcar" | tail -n 1 | awk '{print $6}')
+    mag_abs=$(grep "absolute magnetization" "$outcar" | tail -n 1 | awk '{print $4}')
+    [ -z "$mag_tot" ] && mag_tot=0.00
+    [ -z "$mag_abs" ] && mag_abs=0.00
+
+    max_loc_mag=$(awk '
+      /magnetization \(x\)/ {
+        flag=1; max_val=0; getline; getline; getline; next
+      }
+      flag==1 && /tot/ { flag=0 }
+      flag==1 && /---/ { flag=0 }
+      flag==1 {
+        val = $5; if(val<0) val=-val; if(val>max_val) max_val=val;
+      }
+      END {printf "%.3f", max_val}
+    ' "$outcar")
+    [ -z "$max_loc_mag" ] && max_loc_mag=0.000
+
+    actual_state=$(awk -v tot="$mag_tot" -v abs="$mag_abs" -v max_loc="$max_loc_mag" \
+                       -v thresh="$MAG_THRESHOLD" -v loc_thresh="$LOCAL_MAG_THRESH" '
+    BEGIN {
+        abs_tot = (tot < 0) ? -tot : tot;
+        abs_abs = (abs < 0) ? -abs : abs;
+        
+        if (max_loc < loc_thresh) { print "NM (无磁)" }
+        else if (abs_tot < thresh) { print "AFM (反铁磁)" }
+        else {
+            diff = abs_abs - abs_tot; diff = (diff < 0) ? -diff : diff;
+            if (diff < thresh) { print "FM (铁磁)" }
+            else { print "FiM (亚铁磁)" }
+        }
+    }')
+
+    # 存入数组
+    valid_dirs[$count]=$dir
+    energies[$count]=$e_per_atom
+    states[$count]=$actual_state
+    count=$((count+1))
+done
+
+# ==========================================
+# 结果输出模块
+# ==========================================
+clear
+echo "=================================================="
+echo "              VASP 磁基态快速诊断报告"
+echo "=================================================="
+
+if [ $count -gt 0 ]; then
+    # 寻找基态
+    min_idx=0
+    min_e=${energies[0]}
+    for (( i=1; i<$count; i++ )); do
+        is_smaller=$(awk -v e1="${energies[$i]}" -v e2="$min_e" 'BEGIN{if(e1<e2) print 1; else print 0}')
+        if [ "$is_smaller" -eq 1 ]; then
+            min_e=${energies[$i]}
+            min_idx=$i
+        fi
+    done
+    
+    gs_dir=${valid_dirs[$min_idx]}
+    gs_state=${states[$min_idx]}
+    
+    echo -e " 🏆 \033[1;32m明确结论: 系统的基态是 [ ${gs_dir} ]\033[0m"
+    echo -e " 🧲 实际磁性: \033[1;33m${gs_state}\033[0m"
+    echo -e " ⚡ 基态能量: ${min_e} eV/atom"
+    echo "--------------------------------------------------"
+    
+    # 寻找次低能态并计算能量差
+    if [ $count -gt 1 ]; then
+        second_min_idx=-1
+        second_min_e=999999
+        
+        for (( i=0; i<$count; i++ )); do
+            if [ $i -ne $min_idx ]; then
+                is_smaller=$(awk -v e1="${energies[$i]}" -v e2="$second_min_e" 'BEGIN{if(e1<e2) print 1; else print 0}')
+                if [ "$is_smaller" -eq 1 ]; then
+                    second_min_e=${energies[$i]}
+                    second_min_idx=$i
+                fi
+            fi
+        done
+        
+        delta_e=$(awk -v e1="$second_min_e" -v e2="$min_e" 'BEGIN{printf "%.2f", (e1-e2)*1000}')
+        second_dir=${valid_dirs[$second_min_idx]}
+        second_state=${states[$second_min_idx]}
+        
+        echo -e " 🥈 次低能态: [ ${second_dir} ] (${second_state})"
+        echo -e " ⚖️  能量差(ΔE): +${delta_e} meV/atom"
+        
+        # 简并判断
+        is_degen=$(awk -v de="$delta_e" -v tol="$DEGENERATE_TOL" 'BEGIN{if(de <= tol) print 1; else print 0}')
+        if [ "$is_degen" -eq 1 ]; then
+            echo -e "\n \033[1;31m⚠️  注意: ΔE < 2 meV/atom，这两个磁态发生能量简并，\n     在室温下可能共存，单一基态结论可能不可靠。\033[0m"
+        else
+            echo -e "\n \033[1;32m✅ 结论可靠: ΔE 较大，基态非常稳定。\033[0m"
+        fi
+    else
+        echo -e "\n \033[90m只检测到一个有效数据，无法比较。\033[0m"
+    fi
+else
+    echo -e " \033[1;31m❌ 错误: 未检测到任何成功收敛的计算结果。\033[0m"
+fi
+echo "=================================================="
+

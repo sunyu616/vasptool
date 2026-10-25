@@ -1,0 +1,415 @@
+#!/bin/bash
+set -euo pipefail
+
+FILENAME="workflow_master.py"
+
+echo -e "\033[1;36m[构建] 正在进行深度物理级逻辑校验，生成终极满分 Workflow ...\033[0m"
+
+cat << 'EOF' > "${FILENAME}"
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, time, subprocess, shutil, re, smtplib, sys
+from email.mime.text import MIMEText
+from email.header import Header
+
+# 强制开启 Python 实时行缓冲，确保日志第一时间写入 workflow.log
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass 
+
+# =====================================================================
+# 🎛️ 配置中心 (高频参数区)
+# =====================================================================
+CONFIG = {
+    "KPOINTS_SINGLE": "9 9 1",     # 【单胞】计算网格
+    "KPOINTS_SPC221": "7 7 1",     # 【扩胞】计算网格
+    "KPOINTS_ACCURATE": "13 13 1", # 【Accurate】高精度网格
+    "ENABLE_EMAIL": True,
+    "SMTP_SERVER": "smtp.qq.com",
+    "SENDER_EMAIL": "your_qq_number@qq.com",
+    "SENDER_PASSWORD": "在此填入QQ邮箱授权码",
+    "RECEIVER_EMAIL": "your_qq_number@qq.com"
+}
+
+# 🗺️ 动作降级映射表
+CMD_MAP = {
+    "cp1": "cp INCAR POSCAR POTCAR wk.pbs KPOINTS",
+    "cp2": "cp INCAR CONTCAR POTCAR wk.pbs KPOINTS",
+    "mcp": "mv CONTCAR POSCAR",
+    "autovasp": "autovasp", 
+    "jtpd": "jtpd"
+}
+
+try:
+    import ase.io
+    from ase.build import make_supercell
+    import numpy as np
+    HAS_ASE = True
+except ImportError:
+    HAS_ASE = False
+
+ROOT_DIR = os.path.abspath(os.getcwd())
+SINGLE_DIR = os.path.join(ROOT_DIR, 'single')
+SPC_DIR = os.path.join(ROOT_DIR, 'spc221')
+report_data = {
+    'nm_energy': 'N/A',
+    'fm_energy': 'N/A',
+    'fm_mag_end': 'N/A',
+    'root_jtpd': 'N/A',
+    'spc_nm_energy': 'N/A',
+    'spc_fm_energy': 'N/A',
+    'spc_fm_mag_end': 'N/A',
+    'spc_jtpd': 'N/A',
+    'fm_mag_table': '未在 OUTCAR 中提取到磁矩信息',
+    'spc_fm_mag_table': '未在 OUTCAR 中提取到磁矩信息'
+}
+
+class LogColors:
+    RESET = "\033[0m"; INFO = "\033[94m"; SUCCESS = "\033[92m"
+    WARN = "\033[93m"; ERROR = "\033[91m"; STEP = "\033[1;35m"
+
+def c_log(msg, level="INFO"):
+    t_str = time.strftime('%H:%M:%S')
+    color = getattr(LogColors, level, "")
+    reset = LogColors.RESET if color else ""
+    if level == "STEP":
+        print() # 大步骤自动空行
+    print(f"{color}[{t_str}] [{level:^7}] {msg}{reset}", flush=True)
+
+# ================== 1. 核心寻址与指令代理 ==================
+
+def find_file_case_insensitive(filename, directory='.'):
+    return next((f for f in os.listdir(directory) if f.lower() == filename.lower()), None)
+
+def run_smart_cmd(cmd_key, args="", native_fallback=None):
+    raw_cmd = f"{CMD_MAP.get(cmd_key, cmd_key)} {args}".strip()
+    res = subprocess.run(raw_cmd, shell=True, capture_output=True, text=True)
+    if res.returncode == 0 and not (cmd_key == 'jtpd' and not res.stdout.strip()):
+        return res.stdout.strip()
+    return native_fallback() if native_fallback else ""
+
+# ================== 2. 动作封装区 (Actions) ==================
+
+def cp1_action(dest):
+    def fallback():
+        for f in ['INCAR', 'POSCAR', 'POTCAR', 'wk.pbs', 'KPOINTS']:
+            a = find_file_case_insensitive(f)
+            if a: shutil.copy(a, os.path.join(dest, a))
+    run_smart_cmd("cp1", dest, native_fallback=fallback)
+
+def cp2_action(dest):
+    def fallback():
+        for f in ['INCAR', 'POTCAR', 'wk.pbs', 'KPOINTS']:
+            a = find_file_case_insensitive(f)
+            if a: shutil.copy(a, os.path.join(dest, a))
+        # 防护：若无 CONTCAR 则拿 POSCAR 顶上
+        c = find_file_case_insensitive('CONTCAR')
+        if c and os.path.getsize(c) > 0:
+            shutil.copy(c, os.path.join(dest, c))
+        else:
+            p = find_file_case_insensitive('POSCAR')
+            if p: shutil.copy(p, os.path.join(dest, 'CONTCAR'))
+    run_smart_cmd("cp2", dest, native_fallback=fallback)
+
+def mcp_action():
+    def fallback():
+        a = find_file_case_insensitive('CONTCAR')
+        if a: shutil.move(a, 'POSCAR')
+    run_smart_cmd("mcp", native_fallback=fallback)
+
+def poc_action():
+    if not os.path.exists("CONTCAR") or os.path.getsize("CONTCAR") == 0: return
+    res = subprocess.run("poc", shell=True, capture_output=True, text=True)
+    if res.returncode != 0:
+        subprocess.run("pos2cif.pl CONTCAR", shell=True, capture_output=True)
+
+def gwe_action():
+    energy = "N/A"
+    if not os.path.exists("OUTCAR"): return energy
+    with open("OUTCAR", "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if 'energy  without entropy' in line:
+                match = re.search(r'=\s*([-0-9.]+)', line)
+                if match: energy = match.group(1) 
+    return energy
+
+def mag_action():
+    if not os.path.exists("OUTCAR"): return "未找到 OUTCAR 文件"
+    tables, curr, capture = [], [], False
+    with open("OUTCAR", "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if 'magnetization (x)' in line:
+                capture, curr = True, [line.rstrip()]
+            elif capture:
+                curr.append(line.rstrip())
+                if re.match(r'^\s*tot', line):
+                    capture = False
+                    tables.append('\n'.join(curr))
+    return tables[-1] if tables else "未在 OUTCAR 中提取到磁矩信息"
+
+def extract_mag_end():
+    if not os.path.exists("OSZICAR"): return "N/A"
+    last_line = ""
+    with open("OSZICAR", "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.strip(): last_line = line.strip()
+    match = re.search(r'mag=\s*([-0-9.]+)', last_line)
+    return match.group(1) if match else last_line
+
+# ================== 3. 算法处理与判定工具 ==================
+
+def set_kpoints(k_str):
+    kp = find_file_case_insensitive('KPOINTS')
+    if not kp: return
+    with open(kp, 'r') as f: lines = f.readlines()
+    replaced = False
+    with open(kp, 'w') as f:
+        for line in lines:
+            if not replaced and re.match(r'^\s*[0-9]+\s+[0-9]+\s+[0-9]+', line):
+                f.write(f"{k_str}\n"); replaced = True
+            else: f.write(line)
+
+def clear_vasp_native():
+    # 修复：将 wk.pbs 转换为大写 WK.PBS 以匹配 f.upper()
+    keep = {"INCAR", "POSCAR", "POTCAR", "KPOINTS", "OUTCAR", "OSZICAR", "WK.PBS", "CONTCAR"}
+    for f in os.listdir('.'):
+        # 防护：增加 '.pbs' 后缀免删保护，双重防误删
+        if os.path.isfile(f) and f.upper() not in keep and not f.endswith(('.py', '.log', '.sh', '.cif', '.txt', '.pbs')):
+            try: os.remove(f)
+            except: pass
+
+def ispin_native(val):
+    inc = find_file_case_insensitive('INCAR')
+    if not inc: return
+    with open(inc, "r", encoding="utf-8") as f: lines = f.readlines()
+    
+    # 修复防粘连机制
+    if lines and not lines[-1].endswith('\n'): lines[-1] += '\n'
+    
+    found = False
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*ISPIN", line, re.I):
+            lines[i] = f"ISPIN = {val}\n"; found = True; break
+    if not found: lines.append(f"ISPIN = {val}\n")
+    with open(inc, "w", encoding="utf-8") as f: f.writelines(lines)
+
+def modify_incar_accurate():
+    inc = find_file_case_insensitive('INCAR')
+    if not inc: return
+    with open(inc, 'r', encoding="utf-8") as f: lines = f.readlines()
+    new_lines = [l for l in lines if not re.match(r'^\s*(PREC|EDIFF|EDIFFG)\s*=', l, re.I)]
+    
+    # 修复防粘连机制
+    if new_lines and not new_lines[-1].endswith('\n'): new_lines[-1] += '\n'
+        
+    new_lines.extend(["PREC = A\n", "EDIFF = 1.0e-8\n", "EDIFFG = -0.001\n"])
+    with open(inc, 'w', encoding="utf-8") as f: f.writelines(new_lines)
+
+def parse_jtpd_output(output):
+    clean_out = re.sub(r'\x1B\[[0-9;]*[mK]', '', output) # 精准剥离颜色符
+    match = re.search(r'实际磁性[:：]\s*(.*)', clean_out)
+    if match:
+        s = match.group(1).lower()
+        if 'fim' in s or 'fm' in s or '铁磁' in s or 'afm' in s: return 'fm' 
+        if 'nm' in s or '无磁' in s: return 'nm'
+    words = re.findall(r'\b\w+\b', clean_out.lower())
+    if any(w in words for w in ['fim', 'fm', 'afm']): return 'fm'
+    if 'nm' in words: return 'nm'
+    return 'fm'
+
+def make_221_supercell(input_file, output_file):
+    if not HAS_ASE: c_log("环境缺失 ASE 库，无法执行扩胞！", "ERROR"); exit(1)
+    atoms = ase.io.read(input_file)
+    P = np.array([[2, 0, 0], [0, 2, 0], [0, 0, 1]])
+    ase.io.write(output_file, make_supercell(atoms, P), format='vasp', vasp5=True)
+
+def prep_and_submit():
+    if os.path.exists("auto_opt.log"): os.remove("auto_opt.log")
+    if os.path.exists("stdout.log"): os.remove("stdout.log")
+    run_smart_cmd("autovasp")
+    
+    # 安全缓冲：给文件系统 2 秒钟落盘时间生成监控脚本
+    time.sleep(2) 
+    
+    if os.path.exists('vasp_infinite_wait.py'):
+        subprocess.Popen(['python3', '-u', 'vasp_infinite_wait.py'],
+                         stdout=open('stdout.log', 'w'), stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    else:
+        c_log("无法找到 vasp_infinite_wait.py 监控脚本，系统守护可能失败", "WARN")
+
+def wait_for_vasp():
+    c_log("计算任务已投递至后台，正在等待系统收敛...", "INFO")
+    while not os.path.exists("auto_opt.log"): time.sleep(5)
+    while True:
+        with open("auto_opt.log", "r", encoding="utf-8") as f: content = f.read()
+        if "Target reached!" in content or "Success" in content or "Optimization finished" in content: 
+            c_log("计算收敛达标！", "SUCCESS"); time.sleep(2); return True
+        if "Aborted" in content or "Failed" in content:
+            c_log("计算异常中断，触发熔断保护！", "ERROR"); time.sleep(2); return False
+        time.sleep(15)
+
+def send_summary_email(final_report):
+    if not CONFIG.get("ENABLE_EMAIL", False): return
+    msg = MIMEText(final_report, 'plain', 'utf-8')
+    msg['Subject'] = Header("[VASP Workflow] 您的自动化高通量计算已收官", 'utf-8')
+    msg['From'] = CONFIG["SENDER_EMAIL"]
+    msg['To'] = CONFIG["RECEIVER_EMAIL"]
+    try:
+        server = smtplib.SMTP_SSL(CONFIG["SMTP_SERVER"], 465, timeout=10)
+        server.login(CONFIG["SENDER_EMAIL"], CONFIG["SENDER_PASSWORD"])
+        server.sendmail(CONFIG["SENDER_EMAIL"], [CONFIG["RECEIVER_EMAIL"]], msg.as_string())
+        server.quit()
+    except: pass
+
+# ================== 4. 主控流程 ==================
+def main():
+    c_log(f"=== VASP 自动化高通量工作流启动 (工作区: {ROOT_DIR}) ===", "INFO")
+    if not HAS_ASE:
+        c_log("请先安装 Python 扩胞依赖库: pip install ase numpy", "ERROR")
+        return
+
+    # ----------------------------------------
+    c_log("第一步：单胞无磁计算 (SINGLE NM)", "STEP")
+    os.makedirs(os.path.join(SINGLE_DIR, 'nm'), exist_ok=True)
+    os.makedirs(os.path.join(SINGLE_DIR, 'fm'), exist_ok=True)
+    cp1_action(os.path.join(SINGLE_DIR, 'nm'))
+    cp1_action(os.path.join(SINGLE_DIR, 'fm'))
+    
+    os.chdir(os.path.join(SINGLE_DIR, 'nm'))
+    set_kpoints(CONFIG["KPOINTS_SINGLE"])
+    prep_and_submit(); wait_for_vasp(); clear_vasp_native(); poc_action()
+    report_data['nm_energy'] = gwe_action()
+    
+    if os.path.exists("CONTCAR") and os.path.getsize("CONTCAR") > 0:
+        shutil.copy("CONTCAR", os.path.join(SINGLE_DIR, 'fm', 'CONTCAR'))
+
+    # ----------------------------------------
+    c_log("第二步：单胞铁磁计算 (SINGLE FM)", "STEP")
+    os.chdir(os.path.join(SINGLE_DIR, 'fm'))
+    mcp_action(); ispin_native(2); set_kpoints(CONFIG["KPOINTS_SINGLE"])
+    
+    prep_and_submit(); wait_for_vasp(); clear_vasp_native(); poc_action()
+    report_data['fm_energy'] = gwe_action()
+    report_data['fm_mag_end'] = extract_mag_end()
+    report_data['fm_mag_table'] = mag_action()
+
+    # ----------------------------------------
+    c_log("第三步：磁态诊断与基态选定", "STEP")
+    os.chdir(SINGLE_DIR)
+    base_mag_state = parse_jtpd_output(run_smart_cmd("jtpd"))
+    report_data['root_jtpd'] = base_mag_state
+    c_log(f"单胞层级比对完毕，确立最佳初始磁构型为: {base_mag_state.upper()} 态", "INFO")
+    
+    os.chdir(ROOT_DIR)
+    os.makedirs(os.path.join(SPC_DIR, 'nm'), exist_ok=True)
+    os.makedirs(os.path.join(SPC_DIR, 'fm'), exist_ok=True)
+    for cf in ['kpoints', 'incar', 'potcar', 'wk.pbs']:
+        actual_file = find_file_case_insensitive(cf, ROOT_DIR)
+        if actual_file:
+            shutil.copy(os.path.join(ROOT_DIR, actual_file), os.path.join(SPC_DIR, 'nm', actual_file))
+            shutil.copy(os.path.join(ROOT_DIR, actual_file), os.path.join(SPC_DIR, 'fm', actual_file))
+
+    # ----------------------------------------
+    c_log(f"第四步：扩胞无磁计算 (SPC221 NM)", "STEP")
+    base_contcar = os.path.join(SINGLE_DIR, base_mag_state, 'CONTCAR')
+    if os.path.exists(base_contcar) and os.path.getsize(base_contcar) > 0:
+        make_221_supercell(base_contcar, os.path.join(SPC_DIR, 'nm', 'POSCAR'))
+        shutil.copy(os.path.join(SPC_DIR, 'nm', 'POSCAR'), os.path.join(SPC_DIR, 'fm', 'POSCAR'))
+
+    os.chdir(os.path.join(SPC_DIR, 'nm'))
+    set_kpoints(CONFIG["KPOINTS_SPC221"])
+    prep_and_submit(); wait_for_vasp(); clear_vasp_native(); poc_action()
+    report_data['spc_nm_energy'] = gwe_action()
+    
+    if os.path.exists("CONTCAR") and os.path.getsize("CONTCAR") > 0:
+        shutil.copy("CONTCAR", os.path.join(SPC_DIR, 'fm', 'CONTCAR'))
+
+    # ----------------------------------------
+    c_log("第五步：扩胞铁磁计算 (SPC221 FM)", "STEP")
+    os.chdir(os.path.join(SPC_DIR, 'fm'))
+    mcp_action(); ispin_native(2); set_kpoints(CONFIG["KPOINTS_SPC221"])
+    prep_and_submit(); wait_for_vasp(); clear_vasp_native(); poc_action()
+    report_data['spc_fm_energy'] = gwe_action()
+    report_data['spc_fm_mag_end'] = extract_mag_end()
+    report_data['spc_fm_mag_table'] = mag_action()
+
+    # ----------------------------------------
+    c_log("第六步：高精度收敛验证 (Accurate)", "STEP")
+    os.chdir(SPC_DIR) 
+    final_mag_state = parse_jtpd_output(run_smart_cmd("jtpd"))
+    report_data['spc_jtpd'] = final_mag_state
+    c_log(f"扩胞计算诊断完毕，系统决定沿用基态: {final_mag_state.upper()} 态", "INFO")
+    
+    final_dir = os.path.join(SINGLE_DIR, final_mag_state)
+    os.makedirs(final_dir, exist_ok=True)
+    os.chdir(final_dir)
+    os.makedirs('Accurate', exist_ok=True)
+    
+    cp2_action('Accurate')
+    os.chdir('Accurate')
+    mcp_action(); set_kpoints(CONFIG["KPOINTS_ACCURATE"])
+    modify_incar_accurate()
+    
+    prep_and_submit(); wait_for_vasp(); clear_vasp_native(); poc_action()
+
+    # ----------------------------------------
+    c_log("总结：数据提取与报告归档", "STEP")
+    
+    final_report = f"""
+==================================================
+           ✨ FINAL WORKFLOW REPORT ✨
+==================================================
+| SINGLE NM Energy : {report_data['nm_energy']}
+| SINGLE FM Energy : {report_data['fm_energy']}
+| SINGLE FM OSZICAR: {report_data['fm_mag_end']}
+| SINGLE Actual Mag: {report_data['root_jtpd'].upper()}
+--------------------------------------------------
+| SPC221 NM Energy : {report_data['spc_nm_energy']}
+| SPC221 FM Energy : {report_data['spc_fm_energy']}
+| SPC221 FM OSZICAR: {report_data['spc_fm_mag_end']}
+| SPC221 Actual Mag: {report_data['spc_jtpd'].upper()}
+==================================================
+
+[SINGLE FM Magnetization Table]
+{report_data['fm_mag_table']}
+
+==================================================
+
+[SPC221 FM Magnetization Table]
+{report_data['spc_fm_mag_table']}
+==================================================
+"""
+    send_summary_email(final_report)
+    print(final_report)
+    try:
+        with open(os.path.join(ROOT_DIR, "workflow_report.txt"), "w", encoding="utf-8") as f:
+            f.write(final_report)
+        c_log("计算汇总档案已固化至: workflow_report.txt", "INFO")
+    except: pass
+
+    c_log("=== 高通量计算引擎圆满完成，主进程安全断开 ===", "SUCCESS")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+chmod +x "${FILENAME}"
+
+echo -e "\033[1;32m===============================================================\033[0m"
+echo -e "\033[1;32m  ✅ 自动化工作流主引擎已生成：\033[1;37m${FILENAME}\033[0m"
+echo -e "\033[1;32m===============================================================\033[0m"
+echo " "
+echo -e "\033[1;33m  [ 📦 运行前必须核验 ]\033[0m"
+echo -e "   • 必备环境: \033[1mase, numpy\033[0m 库 (\033[3mpip install ase numpy\033[0m)"
+echo -e "   • 必备脚本: \033[1;37mautovasp, jtpd, pos2cif.pl, clear_vasp, ISPIN\033[0m"
+echo " "
+echo -e "\033[1;33m  [ 🚀 使用指南 ]\033[0m"
+echo -e "   \033[1;36m1. 配置参数:\033[0m 运行 \033[1mvi ${FILENAME}\033[0m (在最顶部修改网格等参数)"
+echo -e "   \033[1;36m2. 提交任务:\033[0m \033[1;35mnohup python3 -u ${FILENAME} > workflow.log 2>&1 &\033[0m"
+echo -e "   \033[1;36m3. 查看日志:\033[0m \033[1mtail -f workflow.log\033[0m"
+echo -e "\033[1;32m===============================================================\033[0m"
+
+

@@ -1,0 +1,70 @@
+#!/bin/bash
+
+# 设置输入和输出文件
+INFILE="POSCAR"
+OUTFILE="POSCAR_frozen"
+
+# 检查输入文件是否存在
+if [ ! -f "$INFILE" ]; then
+    echo "错误: 当前目录下未找到 $INFILE 文件。"
+    exit 1
+fi
+
+echo "正在处理 $INFILE ..."
+echo "目标: 冻结所有原子 (F F F)"
+
+# 使用 awk 处理文件
+awk '
+BEGIN {
+    header_done = 0
+    atoms_read = 0
+}
+
+# 1. 打印前 7 行 (Title, Scale, Lattice vectors, Elements, Atom counts)
+NR <= 7 {
+    print $0
+    # 在第 7 行计算原子总数
+    if (NR == 7) {
+        natoms = 0
+        for (i=1; i<=NF; i++) natoms += $i
+    }
+    next
+}
+
+# 2. 处理第 8 行及之后的逻辑
+{
+    # 如果头部处理尚未标记完成
+    if (header_done == 0) {
+        
+        # 情况 A: 这一行是 "Selective dynamics"
+        if ($1 ~ /^[Ss]/) {
+            print $0             # 打印 "Selective dynamics"
+            getline              # 读取下一行 (坐标系 Direct/Cartesian)
+            print $0             # 打印坐标系
+        } 
+        # 情况 B: 这一行直接是坐标系 (Direct/Cartesian)
+        else {
+            print "Selective dynamics"  # 插入缺失的标识行
+            print $0                    # 打印坐标系
+        }
+        
+        header_done = 1
+        next
+    }
+
+    # 3. 处理原子坐标行
+    if (atoms_read < natoms) {
+        # 打印前三列坐标，并强制后三列为 F F F
+        # 使用 %19.16f 保持 VASP 的高精度格式
+        printf " %19.16f %19.16f %19.16f   F   F   F\n", $1, $2, $3
+        atoms_read++
+        next
+    }
+
+    # 4. 打印剩余内容 (如 Velocities)
+    print $0
+}
+' "$INFILE" > "$OUTFILE"
+
+echo "完成！已生成文件: $OUTFILE"
+echo "请检查文件内容: head -n 15 $OUTFILE"

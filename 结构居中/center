@@ -1,0 +1,217 @@
+#!/bin/bash
+
+# 交互式提示用户输入
+read -p "请输入要居中的文件 (输入 p 代表 POSCAR, c 代表 CONTCAR, 按回车默认 POSCAR): " user_input
+
+# 解析用户输入
+lower_input=$(echo "$user_input" | tr '[:upper:]' '[:lower:]')
+
+if [ "$lower_input" = "p" ]; then
+    filename="POSCAR"
+elif [ "$lower_input" = "c" ]; then
+    filename="CONTCAR"
+elif [ -z "$user_input" ]; then
+    filename="POSCAR" # 默认选项
+else
+    # 如果输入了具体的文件名，也支持直接读取
+    filename="$user_input"
+fi
+
+# 检查文件是否存在
+if [ ! -f "$filename" ]; then
+    echo "错误: 找不到文件 '$filename'"
+    exit 1
+fi
+
+echo "======================================"
+echo "正在处理文件: $filename"
+echo "======================================"
+
+# 使用 awk 处理结构文件
+awk '
+BEGIN { 
+    pi = 3.14159265358979323846 
+}
+{
+    lines[NR] = $0
+}
+END {
+    # 1. 提取晶格矢量 (第 3, 4, 5 行)
+    split(lines[3], a); L11=a[1]; L12=a[2]; L13=a[3]
+    split(lines[4], b); L21=b[1]; L22=b[2]; L23=b[3]
+    split(lines[5], c); L31=c[1]; L32=c[2]; L33=c[3]
+
+    # 计算晶格矩阵行列式
+    D = L11*(L22*L33 - L23*L32) - L12*(L21*L33 - L23*L31) + L13*(L21*L32 - L22*L31)
+    if (D == 0) {
+        print "错误: 晶格矩阵行列式为 0，晶胞参数非法。" > "/dev/stderr"
+        exit 1
+    }
+
+    # 计算逆矩阵 (用于 Cartesian -> Direct 转换)
+    M11 = (L22*L33 - L23*L32) / D
+    M12 = (L13*L32 - L12*L33) / D
+    M13 = (L12*L23 - L13*L22) / D
+    M21 = (L23*L31 - L21*L33) / D
+    M22 = (L11*L33 - L13*L31) / D
+    M23 = (L13*L21 - L11*L23) / D
+    M31 = (L21*L32 - L22*L31) / D
+    M32 = (L12*L31 - L11*L32) / D
+    M33 = (L11*L22 - L12*L21) / D
+
+    # 2. 识别 VASP 格式 (第 6 行是否包含字母)
+    if (lines[6] ~ /^[ \t]*[A-Za-z]/) {
+        vasp5 = 1
+        count_line = 7
+    } else {
+        vasp5 = 0
+        count_line = 6
+    }
+
+    # 3. 计算总原子数
+    total_atoms = 0
+    n_counts = split(lines[count_line], counts)
+    for (i=1; i<=n_counts; i++) {
+        total_atoms += counts[i]
+    }
+
+    # 4. 判断是否包含 Selective dynamics 以及坐标类型
+    mode_line = count_line + 1
+    has_seldyn = 0
+
+    mode_str = lines[mode_line]
+    gsub(/^[ \t]+/, "", mode_str)
+    mode_char = tolower(substr(mode_str, 1, 1))
+
+    if (mode_char == "s") {
+        has_seldyn = 1
+        mode_line++
+        mode_str = lines[mode_line]
+        gsub(/^[ \t]+/, "", mode_str)
+        mode_char = tolower(substr(mode_str, 1, 1))
+    }
+
+    is_cartesian = 0
+    if (mode_char == "c" || mode_char == "k") {
+        is_cartesian = 1
+    } else if (mode_char != "d") {
+        print "错误: 无法识别坐标类型，非 Direct 或 Cartesian。" > "/dev/stderr"
+        exit 1
+    }
+
+    coord_start = mode_line + 1
+
+    # 5. 统一转换并计算圆周均值
+    sum_sin_x = 0; sum_cos_x = 0
+    sum_sin_y = 0; sum_cos_y = 0
+    sum_sin_z = 0; sum_cos_z = 0
+
+    for (i = coord_start; i < coord_start + total_atoms; i++) {
+        split(lines[i], arr)
+        rx = arr[1]; ry = arr[2]; rz = arr[3]
+
+        if (is_cartesian) {
+            # Cartesian 转 Direct
+            fx = rx * M11 + ry * M21 + rz * M31
+            fy = rx * M12 + ry * M22 + rz * M32
+            fz = rx * M13 + ry * M23 + rz * M33
+        } else {
+            fx = rx; fy = ry; fz = rz
+        }
+
+        # 保存用于后续平移
+        frac_x[i] = fx
+        frac_y[i] = fy
+        frac_z[i] = fz
+
+        # 圆周均值累加
+        ax = fx * 2 * pi
+        ay = fy * 2 * pi
+        az = fz * 2 * pi
+
+        sum_sin_x += sin(ax); sum_cos_x += cos(ax)
+        sum_sin_y += sin(ay); sum_cos_y += cos(ay)
+        sum_sin_z += sin(az); sum_cos_z += cos(az)
+    }
+
+    angle_x = atan2(sum_sin_x, sum_cos_x)
+    angle_y = atan2(sum_sin_y, sum_cos_y)
+    angle_z = atan2(sum_sin_z, sum_cos_z)
+
+    if (angle_x < 0) angle_x += 2 * pi
+    if (angle_y < 0) angle_y += 2 * pi
+    if (angle_z < 0) angle_z += 2 * pi
+
+    cx = angle_x / (2 * pi)
+    cy = angle_y / (2 * pi)
+    cz = angle_z / (2 * pi)
+
+    # 计算在 Direct 空间中向 0.5 的平移量
+    shift_x = 0.5 - cx
+    shift_y = 0.5 - cy
+    shift_z = 0.5 - cz
+
+    # 6. 输出更新后的内容
+    for (i = 1; i < coord_start; i++) {
+        print lines[i]
+    }
+
+    # 平移并输出坐标
+    for (i = coord_start; i < coord_start + total_atoms; i++) {
+        n_arr = split(lines[i], arr)
+        
+        nx = frac_x[i] + shift_x
+        ny = frac_y[i] + shift_y
+        nz = frac_z[i] + shift_z
+
+        # 将原子强制约束在 [0, 1) 的 Direct 空间中
+        nx = nx - int(nx); if (nx < 0) nx += 1.0
+        ny = ny - int(ny); if (ny < 0) ny += 1.0
+        nz = nz - int(nz); if (nz < 0) nz += 1.0
+        if (nx >= 1.0) nx -= 1.0
+        if (ny >= 1.0) ny -= 1.0
+        if (nz >= 1.0) nz -= 1.0
+
+        if (is_cartesian) {
+            # Direct 转回 Cartesian
+            out_x = nx * L11 + ny * L21 + nz * L31
+            out_y = nx * L12 + ny * L22 + nz * L32
+            out_z = nx * L13 + ny * L23 + nz * L33
+        } else {
+            out_x = nx
+            out_y = ny
+            out_z = nz
+        }
+
+        # 打印坐标和注释
+        if (has_seldyn) {
+            printf " %16.9f %16.9f %16.9f   %s   %s   %s", out_x, out_y, out_z, arr[4], arr[5], arr[6]
+            for (j=7; j<=n_arr; j++) printf "  %s", arr[j]
+            printf "\n"
+        } else {
+            printf " %16.9f %16.9f %16.9f", out_x, out_y, out_z
+            for (j=4; j<=n_arr; j++) printf "  %s", arr[j]
+            printf "\n"
+        }
+    }
+
+    # 输出尾部剩余的其他行
+    for (i = coord_start + total_atoms; i <= NR; i++) {
+        print lines[i]
+    }
+}
+' "$filename" > tmp_centered_poscar
+
+# 检查处理是否成功且零时文件不为空
+if [ $? -eq 0 ] && [ -s tmp_centered_poscar ]; then
+    mv tmp_centered_poscar "$filename"
+    echo "成功: 结构已居中！"
+    echo "原文件 '$filename' 已被覆盖。"
+else
+    rm -f tmp_centered_poscar
+    echo "失败: 处理过程中发生错误，未修改原文件。"
+    exit 1
+fi
+
+
+

@@ -1,0 +1,35 @@
+#!/bin/bash
+# 获取当前目录下所有的文件夹
+echo "开始批量提交任务..."
+echo "----------------------------------------"
+for dir in */; do
+    # 去掉目录名后面的斜杠 (例如 "01/" -> "01")
+    dirname=${dir%/}
+    
+    # 检查是否是目录
+    if [ -d "$dirname" ]; then
+        echo "进入文件夹: $dirname"
+        
+        # 进入目录
+        cd "$dirname" || continue
+
+        # 检查提交脚本是否存在
+        if [ -f "wk.pbs" ]; then
+            # 检查是否包含 VASP 关键文件 (可选，防止提交空文件夹)
+            if [ -f "INCAR" ] && [ -f "POSCAR" ] && [ -f "POTCAR" ] && [ -f "KPOINTS" ]; then 
+                qsub wk.pbs
+                
+            else
+                echo "警告: 缺少 VASP 输入文件 (INCAR/POSCAR等)，跳过提交"
+            fi
+        else
+            echo "错误: 找不到提交脚本 'wk.pbs'，跳过"
+        fi
+
+        # 返回上一级目录
+        cd ..
+        echo "----------------------------------------"
+    fi
+done
+
+echo "所有文件夹处理完毕"

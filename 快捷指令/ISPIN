@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# 1. 检查是否提供了输入参数
+if [ -z "$1" ]; then
+    echo "错误: 请输入想要设置的 ISPIN 数值 (例如: 1 或 2)"
+    echo "用法: ./chispin.sh <数值>"
+    exit 1
+fi
+
+NEW_VAL=$1
+INCAR_FILE="INCAR"
+
+# 2. 检查 INCAR 文件是否存在
+if [ ! -f "$INCAR_FILE" ]; then
+    echo "错误: 当前目录下未找到 INCAR 文件。"
+    exit 1
+fi
+
+# 3. 检查 ISPIN 是否已经存在于 INCAR 中
+if grep -q "^\s*ISPIN" "$INCAR_FILE"; then
+    # 如果存在，使用 sed 进行替换 (支持 ISPIN=1, ISPIN = 1 等格式)
+    sed -i "s/^\s*ISPIN\s*=.*/ISPIN = $NEW_VAL/g" "$INCAR_FILE"
+    echo "已将 $INCAR_FILE 中的 ISPIN 修改为 $NEW_VAL"
+else
+    # 如果不存在，追加到文件末尾
+    echo "ISPIN = $NEW_VAL" >> "$INCAR_FILE"
+    echo "已在 $INCAR_FILE 末尾添加 ISPIN = $NEW_VAL"
+fi
+

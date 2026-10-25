@@ -1,0 +1,438 @@
+#!/bin/bash
+
+# ==================================================================
+# Phonopy 全自动计算与绘图脚本 (Final Pro 终极修正版)
+# 
+# [阶段一：自动准备] 
+# -> vaspkit 302 自动获取高对称路径，动态推算 DIM，生成 band.conf
+# [阶段二：计算与绘图] 
+# -> 修复 set -e 下的 ls 崩溃问题，兼容各类型命名规范
+# -> 稳健提取 band.yaml 的高对称点位置，强制对齐 Ticks 与 Labels 防崩溃
+# [阶段三：数据分析与智能报告]
+# -> 精确判断虚频，多路径搜索参数文件，给出权威建议
+# ==================================================================
+
+set -e
+
+echo "========================================"
+echo "[Phase 1] 开始自动推算参数并生成 band.conf..."
+echo "========================================"
+
+# --- 1. 调用 vaspkit 302 ---
+if command -v vaspkit &> /dev/null; then
+    echo "-> 正在调用 vaspkit 302 生成 KPATH.in..."
+    echo -e "302\n" | vaspkit > /dev/null 2>&1
+    if [ ! -f "KPATH.in" ]; then
+        echo "错误：vaspkit 302 未能生成 KPATH.in，请确保当前目录下有 POSCAR/PRIMCELL.vasp。"
+        exit 1
+    fi
+else
+    echo "错误：未检测到 vaspkit 命令，请确保已正确加载 vaspkit。"
+    exit 1
+fi
+
+# --- 2. 注入 Python 脚本自动计算 DIM 并读取 KPATH.in 生成 band.conf ---
+cat << 'EOF' > prep_band.py
+import math
+import glob
+import os
+import sys
+
+dim_str = ""
+if os.path.exists("phonopy_disp.yaml"):
+    with open("phonopy_disp.yaml", "r") as f:
+        for line in f:
+            if "dim:" in line:
+                raw_dim = line.split(":")[1]
+                dim_str = raw_dim.replace("[","").replace("]","").replace(","," ").replace('"',"").replace("'","").strip()
+                print(f"-> 成功从 phonopy_disp.yaml 提取 DIM: {dim_str}")
+                break
+
+if not dim_str:
+    if not os.path.exists("POSCAR"):
+        print("错误：未找到原胞 POSCAR 文件，无法推算 DIM。")
+        sys.exit(1)
+
+    displaced_poscars = glob.glob("POSCAR-00[1-9]") + glob.glob("SPOSCAR") + glob.glob("disp-*")
+    if not displaced_poscars:
+        print("错误：未找到 Phonopy 生成的超胞文件。")
+        sys.exit(1)
+    
+    displaced = sorted(displaced_poscars)[0]
+    if os.path.isdir(displaced) and os.path.exists(os.path.join(displaced, "POSCAR")):
+        displaced = os.path.join(displaced, "POSCAR")
+
+    def get_lattice_vectors(filename):
+        with open(filename, 'r') as f:
+            lines = f.readlines()
+            try:
+                scale = float(lines[1].strip())
+                if scale < 0: scale = 1.0 
+            except ValueError:
+                scale = 1.0
+            v1 = [float(x)*scale for x in lines[2].split()]
+            v2 = [float(x)*scale for x in lines[3].split()]
+            v3 = [float(x)*scale for x in lines[4].split()]
+        return v1, v2, v3
+
+    def vec_len(v):
+        return math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
+
+    v1_orig, v2_orig, v3_orig = get_lattice_vectors("POSCAR")
+    v1_super, v2_super, v3_super = get_lattice_vectors(displaced)
+
+    dim_x = max(1, round(vec_len(v1_super) / vec_len(v1_orig)))
+    dim_y = max(1, round(vec_len(v2_super) / vec_len(v2_orig)))
+    dim_z = max(1, round(vec_len(v3_super) / vec_len(v3_orig)))
+    dim_str = f"{dim_x} {dim_y} {dim_z}"
+    print(f"-> 成功对比晶格推算出 DIM: {dim_str}")
+
+coords, labels = [], []
+with open("KPATH.in", "r") as f:
+    lines = f.readlines()
+    start = False
+    for line in lines:
+        if "Reciprocal" in line or "RECIPROCAL" in line.upper():
+            start = True
+            continue
+        if start:
+            parts = line.strip().split()
+            if len(parts) >= 4:
+                c = f"{parts[0]} {parts[1]} {parts[2]}"
+                l = parts[3]
+                if l.upper() in ["GAMMA", "G"]:
+                    l = r"\Gamma"
+                coords.append(c)
+                labels.append(l)
+
+if not coords:
+    print("错误：未能在 KPATH.in 中提取到高对称点坐标！")
+    sys.exit(1)
+
+final_coords, final_labels = [coords[0]], [labels[0]]
+for i in range(1, len(coords), 2):
+    final_coords.append(coords[i])
+    final_labels.append(labels[i])
+    if i + 1 < len(coords) and coords[i] != coords[i+1]:
+        final_coords.extend([",", coords[i+1]])
+        final_labels.extend([",", labels[i+1]])
+
+band_str = "".join([c + "  " if c != "," else c for c in final_coords]).replace(" ,", ",")
+band_labels_str = " ".join([l for l in final_labels if l != ","])
+
+with open("band.conf", "w") as f:
+    f.write('EIGENVECTORS = .TRUE.\n')
+    f.write(f'DIM = {dim_str}\n')
+    f.write('FORCE_CONSTRAINS = READ\n')
+    f.write(f'BAND = {band_str.strip()}\n')
+    f.write(f'BAND_LABELS = {band_labels_str.strip()}\n')
+    f.write('BAND_POINTS = 101\n')
+    f.write('BAND_CONNECTION = .FALSE.\n')
+    f.write('FC_SYMMETRY = 181\n')
+    f.write('GROUP_VELOCITY = .TRUE.\n')
+
+print("-> band.conf 文件已成功生成！\n")
+EOF
+
+python3 prep_band.py
+rm prep_band.py
+
+echo "========================================"
+echo "[Phase 2] 开始力常数计算与能带后处理绘图"
+echo "========================================"
+
+if [ ! -f "FORCE_SETS" ]; then
+    echo "[Step 1] 检测 vasprun.xml 并生成 FORCE_SETS..."
+    files=$(ls -v */vasprun.xml 2>/dev/null || true)
+    
+    if [ -z "$files" ]; then
+        echo "错误：未在子目录下找到 vasprun.xml 文件，请确保 VASP 计算已完成。"
+        exit 1
+    fi
+    phonopy -f $files
+    echo "-> FORCE_SETS 生成完毕。"
+else
+    echo "[Step 1] FORCE_SETS 已存在，跳过提取步骤。"
+fi
+
+echo "[Step 2] 计算 phonon band..."
+phonopy band.conf > /dev/null
+
+echo "[Step 3] 导出绘图数据..."
+dim_line=$(grep -i "DIM" band.conf)
+dim_suffix=$(echo "$dim_line" | awk -F= '{print $2}' | tr -d '[:space:]')
+data_file="phono${dim_suffix}.dat"
+bandplot --gnuplot > "$data_file"
+
+echo "[Step 4] 生成 Python 脚本并绘图 (超稳健内核)..."
+cat << 'EOF' > plot_v3.py
+import matplotlib.pyplot as plt
+import numpy as np
+import sys
+
+plt.rcParams['text.usetex'] = False
+plt.rcParams['mathtext.fontset'] = 'cm'
+plt.rcParams['font.family'] = 'STIXGeneral'
+plt.rcParams['font.size'] = 14
+plt.rcParams['axes.linewidth'] = 1.2
+
+data_file = sys.argv[1]
+output_file = "phonon_dispersion.png"
+conf_file = "band.conf"
+
+# 1. 读取数据 (.dat 的空行分隔的是能带分支，不是K路径分段)
+segments_x, segments_y = [], []
+current_x, current_y = [], []
+
+try:
+    with open(data_file, 'r') as f:
+        for line in f:
+            if line.strip() == "":
+                if current_x:
+                    segments_x.append(np.array(current_x))
+                    segments_y.append(np.array(current_y))
+                    current_x, current_y = [], []
+                continue
+            try:
+                parts = [float(x) for x in line.split()]
+                current_x.append(parts[0])
+                current_y.append(parts[1:])
+            except ValueError:
+                continue
+    if current_x:
+        segments_x.append(np.array(current_x))
+        segments_y.append(np.array(current_y))
+except FileNotFoundError:
+    print(f"Error: 找不到数据文件 {data_file}")
+    sys.exit(1)
+
+# 2. 稳健读取 YAML 获取真实的高对称点坐标 (Ticks)
+ticks = []
+distances = []
+segments = []
+try:
+    with open("band.yaml", 'r') as f:
+        lines = f.readlines()
+    
+    for i, line in enumerate(lines):
+        if "segment_nqpoint:" in line:
+            if '[' in line:
+                content = line.split('[')[1].split(']')[0]
+                segments = [int(x) for x in content.replace(',', ' ').split()]
+            else:
+                j = i + 1
+                while j < len(lines):
+                    l_strip = lines[j].strip()
+                    if l_strip.startswith('-'):
+                        segments.append(int(l_strip.lstrip('- ').strip()))
+                    else:
+                        break
+                    j += 1
+            break
+            
+    for line in lines:
+        if "distance:" in line:
+            try:
+                distances.append(float(line.split(':')[1].strip()))
+            except ValueError:
+                continue
+                
+    if distances:
+        ticks.append(distances[0])
+        if not segments:
+            segments = [101] * (len(distances) // 101)
+        
+        current_idx = 0
+        for n in segments:
+            current_idx += n
+            idx = min(current_idx - 1, len(distances) - 1)
+            ticks.append(distances[idx])
+except Exception as e:
+    print(f"Warning: 解析 band.yaml 失败: {e}")
+
+if not ticks:
+    all_x = np.concatenate(segments_x) if segments_x else [0, 1]
+    ticks = [np.min(all_x), np.max(all_x)]
+
+# 3. 从 band.conf 读取标签
+labels = []
+try:
+    with open(conf_file, 'r') as f:
+        for line in f:
+            if "BAND_LABELS" in line:
+                raw_labels = line.split('=')[1].strip().split()
+                for l in raw_labels:
+                    clean_l = l.replace("'", "").replace('"', "")
+                    if clean_l.startswith("\\"): 
+                        labels.append(r"$%s$" % clean_l)
+                    elif clean_l.upper() in ["G", "GAMMA"]:
+                        labels.append(r"$\Gamma$")
+                    else:
+                        labels.append(clean_l)
+except Exception:
+    pass
+
+# 强制对齐逻辑：确保 Labels 和 Ticks 数量严格一致，防止抛出 ValueError
+if labels:
+    if len(labels) != len(ticks):
+        print(f"Info: Labels ({len(labels)}) 与 Ticks ({len(ticks)}) 数量不一致，进行强制对齐。")
+        min_len = min(len(labels), len(ticks))
+        labels = labels[:min_len]
+        ticks = ticks[:min_len]
+
+# 4. 绘图
+fig, ax = plt.subplots(figsize=(8, 6))
+
+for sx, sy in zip(segments_x, segments_y):
+    ax.plot(sx, sy, color='#d62728', linewidth=1.5, alpha=0.9)
+
+for t in ticks:
+    ax.axvline(x=t, color='black', linestyle='--', linewidth=1.0, alpha=0.7)
+ax.axhline(y=0, color='black', linestyle='--', linewidth=1.0, alpha=0.7)
+
+ax.set_xlim(ticks[0] if ticks else 0, ticks[-1] if ticks else 1)
+ax.set_xticks(ticks)
+
+if labels:
+    ax.set_xticklabels(labels, fontsize=16)
+
+ax.set_xlabel("")
+ax.set_ylabel("Frequency (THz)", fontsize=16)
+ax.tick_params(axis='y', labelsize=14)
+ax.tick_params(axis='x', length=0) 
+
+plt.tight_layout()
+plt.savefig(output_file, dpi=300, bbox_inches='tight')
+print(f"-> 出图成功: {output_file}")
+EOF
+
+python3 plot_v3.py "$data_file"
+rm plot_v3.py
+
+echo "========================================"
+echo "[Phase 3] 开始声子谱频率与结构稳定性分析"
+echo "========================================"
+
+cat << 'EOF' > generate_report.py
+import os
+import sys
+import glob
+
+data_file = sys.argv[1]
+conf_file = "band.conf"
+
+min_freq = 0.0
+try:
+    with open(data_file, 'r') as f:
+        for line in f:
+            if line.strip() == "": continue
+            try:
+                freqs = [float(x) for x in line.split()][1:]
+                if freqs and min_freq > min(freqs):
+                    min_freq = min(freqs)
+            except ValueError:
+                pass
+except Exception as e:
+    print(f"读取频率数据失败: {e}")
+    sys.exit(0)
+
+has_imaginary = min_freq < -0.001
+
+dim_str = "未知"
+try:
+    with open(conf_file, 'r') as f:
+        for line in f:
+            if "DIM" in line.upper():
+                dim_str = line.split("=")[1].strip()
+except: pass
+
+calc_dirs = ["."] + sorted(glob.glob("01*")) + sorted(glob.glob("disp-*")) + sorted(glob.glob("001"))
+
+def find_file(filename):
+    for d in calc_dirs:
+        path = os.path.join(d, filename)
+        if os.path.exists(path) and os.path.isfile(path):
+            with open(path, 'r') as f:
+                return f.read()
+    return "未找到"
+
+incar_content = find_file("INCAR")
+kpoints_content = find_file("KPOINTS")
+
+def extract_incar_param(param, text):
+    if text == "未找到": return "未知"
+    for line in text.split('\n'):
+        if '#' in line: line = line.split('#')[0]
+        if line.strip().upper().startswith(param.upper()):
+            parts = line.split('=')
+            if len(parts) > 1:
+                return parts[1].split()[0].strip()
+    return "未设置(默认)"
+
+encut = extract_incar_param("ENCUT", incar_content)
+ediff = extract_incar_param("EDIFF", incar_content)
+ediffg = extract_incar_param("EDIFFG", incar_content)
+prec = extract_incar_param("PREC", incar_content)
+
+kmesh = "未知"
+if kpoints_content != "未找到":
+    lines = [l.strip() for l in kpoints_content.split('\n') if l.strip()]
+    if len(lines) >= 4:
+        kmesh = lines[3]
+    elif len(lines) > 0:
+        kmesh = "Auto或Gamma: " + lines[-1]
+
+print("\n" + "="*50)
+print("     【 声子谱频率与结构稳定性分析报告 】")
+print("="*50)
+
+if not has_imaginary:
+    print(" [结果判定]: 体系全为实频，未发现虚频现象！")
+    print(f" [最小频率]: {min_freq:.4f} THz")
+    print(" [总体结论]: 恭喜！该结构在当前的计算条件下是动力学稳定的。")
+else:
+    print(" [结果判定]: 体系存在虚频 (Imaginary Frequencies)！")
+    print(f" [最大虚频]: {min_freq:.4f} THz (以负频形式表现)")
+    
+    print("\n ---【相关计算参数快照】---")
+    print(f"  * 超胞倍数 (DIM) : {dim_str}")
+    print(f"  * INCAR 关键参数 : ENCUT={encut}, EDIFF={ediff}, EDIFFG={ediffg}, PREC={prec}")
+    print(f"  * KPOINTS 网格   : {kmesh}")
+
+    print("\n ---【虚频深度分析与改进建议】---")
+    if min_freq > -0.15:
+        print("  [分析]: 当前虚频非常小 (绝对值 < 0.15 THz)。")
+        print("          这通常发生在高对称点 (如 Gamma 点) 附近的声学支发生微小软化，")
+        print("          极有可能是由于 FFT 网格计算精度不足或有限的数值噪声引起的。")
+        print("  [消除建议]:")
+        print("    1. 提高自洽电子步收敛标准：将 EDIFF 提高至 1E-7 或 1E-8。")
+        print("    2. 提高结构弛豫精度：确保受力充分收敛，EDIFFG 建议设为 -0.001。")
+        print("    3. 消除网格误差：在 INCAR 中加入 ADDGRID=.TRUE.，并确保 PREC=Accurate。")
+        print("    4. 尝试略微提升 ENCUT 和 KPOINTS 密度。")
+    elif min_freq > -0.6:
+        print("  [分析]: 存在中等程度的虚频。")
+        print("          这说明当前结构在位能面上并未收敛到真实的极小值点，")
+        print("          或者受到了所选用超胞尺寸(边界条件)的物理限制。")
+        print("  [消除建议]:")
+        print("    1. 检查构型弛豫：核查原胞在优化过程中的受力是否真的完全收敛。")
+        print(f"    2. 扩充超胞尺寸：当前 DIM={dim_str} 的超胞可能不足以囊括长程作用，建议建立更大的超胞。")
+        print("    3. 打破对称性重算：沿虚频振动方向手动微调原子坐标以打破对称性，并重新弛豫。")
+    else:
+        print("  [分析]: 存在显著的巨大虚频 (低于 -0.6 THz)！")
+        print("          这种量级的虚频通常表明该晶体结构存在本质上的动力学不稳定，")
+        print("          或者该结构仅代表某个相变过程中的过渡态/鞍点。")
+        print("  [消除建议]:")
+        print("    1. 沿虚频对应的 Eigenvectors 移动原子，构建新初始结构再做彻底的结构弛豫。")
+        print("    2. 评估当前的化学配比与物理条件，寻找其他可能的真正基态构型。")
+        print("\n  [结论]: 该量级的虚频往往【无法通过单纯提升精度参数消除】，需从物理模型破局。")
+        
+print("="*50 + "\n")
+EOF
+
+python3 generate_report.py "$data_file"
+rm generate_report.py
+
+echo "----------------------------------------"
+echo "全部流程执行完毕！能带图与分析报告均已生成！"
+echo "----------------------------------------"
+

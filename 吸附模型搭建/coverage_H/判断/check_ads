@@ -1,0 +1,83 @@
+#!/bin/bash
+
+# ==========================================
+# 极简控制台
+# 定义您的吸附物元素符号 (用空格隔开)
+ADSORBATES="H"
+# ==========================================
+
+# 1. 检查必要文件是否存在
+if [ ! -f "POSCAR" ] || [ ! -f "CONTCAR" ]; then
+    echo "❌ 错误：当前目录下找不到 POSCAR 或 CONTCAR！"
+    exit 1
+fi
+
+# 2. 安全传参：将 Bash 变量导出为环境变量，避开字符串拼接
+export ADSORBATES_ENV="$ADSORBATES"
+
+# 3. 使用 'EOF' (带单引号) 彻底关闭 Bash 对内部文本的解析，保证 Python 代码原汁原味
+python3 - << 'EOF'
+import sys
+import os
+import numpy as np
+
+try:
+    from ase.io import read
+    from ase.geometry import find_mic
+except ImportError:
+    print('❌ 错误: 找不到 ASE 库。请在终端执行: pip install ase')
+    sys.exit(1)
+
+try:
+    initial = read('POSCAR')
+    final = read('CONTCAR')
+except Exception as e:
+    print(f'❌ 读取结构文件失败: {e}')
+    sys.exit(1)
+
+if len(initial) != len(final):
+    print('❌ 警告: POSCAR 和 CONTCAR 的原子数量不一致，无法直接比对！')
+    sys.exit(1)
+
+# 安全地从环境变量获取吸附物参数
+adsorbates_str = os.environ.get('ADSORBATES_ENV', '')
+adsorbates = adsorbates_str.split()
+
+sub_indices = [a.index for a in initial if a.symbol not in adsorbates]
+
+if not sub_indices:
+    print('❌ 未找到底物原子，请检查脚本顶部的 ADSORBATES 变量。')
+    sys.exit(1)
+
+pos_i = initial.positions[sub_indices]
+pos_f = final.positions[sub_indices]
+
+# 计算带周期性边界的位移 (跨原胞的移动也能被准确计算)
+delta_pos = pos_f - pos_i
+_, dists = find_mic(delta_pos, final.cell, final.pbc)
+
+max_disp = np.max(dists)
+mean_disp = np.mean(dists)
+max_idx = sub_indices[np.argmax(dists)]
+max_sym = initial[max_idx].symbol
+
+print('\n' + '='*50)
+print('📊 催化剂底物形变评估报告 (Substrate Deformation)')
+print('='*50)
+print(f'参与评估的底物原子数: {len(sub_indices)}')
+print(f'  ➤ 平均原子位移 (RMSD)  : {mean_disp:.4f} Å')
+print(f'  ➤ 最大原子位移 (Max)   : {max_disp:.4f} Å')
+# +1 是为了与 VASP/VESTA 中从 1 开始的原子序号对齐
+print(f'  ➤ 发生最大位移的原子   : {max_sym} (原POSCAR原子序 {max_idx + 1})')
+print('-' * 50)
+
+if max_disp < 0.2:
+    print('✅ 诊断: 底物结构非常稳定，属于理想的表面吸附。')
+elif max_disp < 0.5:
+    print('⚠️ 诊断: 表面发生了一定程度的弛豫 (Relaxation)。需在VESTA中确认是否影响催化可逆性。')
+else:
+    print('🚨 警告: 检测到严重形变 (位移 > 0.5 Å)！')
+    print('   该结构可能发生了表面重构或成键断裂。建议舍弃该构型。')
+print('='*50 + '\n')
+EOF
+
